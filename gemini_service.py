@@ -24,7 +24,16 @@ async def run_gemini_live(
     client = genai.Client(api_key=settings.gemini_api_key)
     async with client.aio.live.connect(
         model=settings.gemini_live_model,
-        config=types.LiveConnectConfig(response_modalities=["AUDIO"]),
+                config=types.LiveConnectConfig(
+            response_modalities=["AUDIO"],
+            realtime_input_config=types.RealtimeInputConfig(
+                automatic_activity_detection=types.AutomaticActivityDetection(
+                    disabled=True
+                )
+            ),
+            input_audio_transcription=types.AudioTranscriptionConfig(),
+            output_audio_transcription=types.AudioTranscriptionConfig(),
+        ),
     ) as session:
         await stream_live_session(peripherals, session)
 
@@ -174,6 +183,13 @@ async def handle_live_response(
     if server_content is None:
         return speaking
 
+    heard = getattr(server_content, "input_transcription", None)
+    if heard is not None and getattr(heard, "text", None):
+        print(f"[You] {heard.text}", flush=True)
+    said = getattr(server_content, "output_transcription", None)
+    if said is not None and getattr(said, "text", None):
+        print(f"[Iris] {said.text}", flush=True)
+
     if server_content.interrupted:
         while True:
             try:
@@ -222,6 +238,7 @@ async def listen_for_button_events(
     peripherals: CompanionPeripherals, session: Any
 ) -> None:
     """Use Space to talk and hold C to share camera frames."""
+    from google.genai import types
     tasks = (
         asyncio.create_task(
             listen_for_capture_button(
@@ -230,8 +247,11 @@ async def listen_for_button_events(
                 peripherals.audio_input.stop_capture,
                 lambda: send_audio_frames(peripherals, session),
                 status_label="Listening (sending microphone audio)",
+                on_capture_started=lambda: session.send_realtime_input(
+                    activity_start=types.ActivityStart()
+                ),
                 on_capture_stopped=lambda: session.send_realtime_input(
-                    audio_stream_end=True
+                    activity_end=types.ActivityEnd()
                 ),
             )
         ),
@@ -267,6 +287,7 @@ async def listen_for_capture_button(
     send_frames: Callable[[], Awaitable[None]],
     status_label: str,
     on_capture_stopped: Callable[[], Awaitable[None]] | None = None,
+    on_capture_started: Callable[[], Awaitable[None]] | None = None,
 ) -> None:
     """Start streaming while a button is held, then stop on release."""
     events = button.events().__aiter__()
@@ -288,6 +309,8 @@ async def listen_for_capture_button(
                 next_event = asyncio.create_task(anext(events))
 
                 if event.pressed and sender is None:
+                    if on_capture_started is not None:
+                        await on_capture_started()
                     await start_capture()
                     sender = asyncio.create_task(send_frames())
                     print(f"[Live] {status_label}.", flush=True)

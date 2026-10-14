@@ -36,6 +36,9 @@ class LaptopAudioInput:
         if self._stream is not None and self._stream.active:
             return
 
+        while not self._queue.empty():
+            self._queue.get_nowait()
+
         self._loop = asyncio.get_running_loop()
 
         if self._stream is None:
@@ -71,8 +74,7 @@ class LaptopAudioInput:
         if self._stream is not None and self._stream.active:
             self._stream.stop()
 
-        while not self._queue.empty():
-            self._queue.get_nowait()
+        await asyncio.sleep(0)
         self._queue.put_nowait(None)
 
     async def close(self) -> None:
