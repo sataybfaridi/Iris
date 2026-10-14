@@ -13,6 +13,7 @@ VIDEO_FRAME_HEIGHT = 480
 VIDEO_FRAMES_PER_SECOND = 1
 
 
+
 def _validate_pcm(data: bytes) -> None:
     if not isinstance(data, bytes):
         raise TypeError("PCM payload must be bytes.")
@@ -71,7 +72,11 @@ class ButtonEvent:
 
 @runtime_checkable
 class AudioInput(Protocol):
+    async def start_capture(self) -> None: ...
+
     def frames(self) -> AsyncIterator[AudioInputFrame]: ...
+
+    async def stop_capture(self) -> None: ...
 
     async def close(self) -> None: ...
 
@@ -82,10 +87,13 @@ class AudioOutput(Protocol):
 
     async def close(self) -> None: ...
 
-
 @runtime_checkable
 class Camera(Protocol):
+    async def start_capture(self) -> None: ...
+
     def frames(self) -> AsyncIterator[VideoFrame]: ...
+
+    async def stop_capture(self) -> None: ...
 
     async def close(self) -> None: ...
 
@@ -102,7 +110,8 @@ class CompanionPeripherals(Protocol):
     audio_input: AudioInput
     audio_output: AudioOutput
     camera: Camera
-    button: Button
+    talk_button: Button
+    camera_button: Button
 
     async def start(self) -> None: ...
 
