@@ -57,10 +57,12 @@ class LaptopAudioInput:
             )
 
     async def frames(self):
-        """Yield microphone audio frames while audio is available."""
+        """Yield one capture's queued microphone frames."""
 
         while True:
             pcm = await self._queue.get()
+            if pcm is None:
+                return
             yield AudioInputFrame(pcm=pcm)
 
     async def stop_capture(self) -> None:
@@ -71,6 +73,7 @@ class LaptopAudioInput:
 
         while not self._queue.empty():
             self._queue.get_nowait()
+        self._queue.put_nowait(None)
 
     async def close(self) -> None:
         """Close the laptop microphone."""
@@ -103,11 +106,13 @@ class LaptopAudioOutput:
     def __init__(self) -> None:
         self._stream = None
         self._lock = asyncio.Lock()
+        self._generation = 0
 
     async def play(self, frame: AudioOutputFrame) -> None:
         """Play one audio frame through the laptop speaker."""
 
         async with self._lock:
+            generation = self._generation
             if self._stream is None:
                 self._stream = sd.RawOutputStream(
                     samplerate=AUDIO_OUTPUT_SAMPLE_RATE_HZ,
@@ -116,18 +121,36 @@ class LaptopAudioOutput:
                 )
                 self._stream.start()
 
-            await asyncio.to_thread(
-                self._stream.write,
-                frame.pcm,
-            )
+            stream = self._stream
+            try:
+                await asyncio.to_thread(stream.write, frame.pcm)
+            except sd.PortAudioError:
+                if generation != self._generation:
+                    return
+                raise
+
+    async def interrupt(self) -> None:
+        """Immediately abort queued speaker audio so a user can barge in."""
+        self._generation += 1
+        stream = self._stream
+        if stream is None:
+            return
+
+        await asyncio.to_thread(stream.abort)
+
+        async with self._lock:
+            if self._stream is stream:
+                stream.close()
+                self._stream = None
 
     async def close(self) -> None:
         """Close the laptop speaker output."""
 
-        if self._stream is not None:
-            self._stream.stop()
-            self._stream.close()
-            self._stream = None
+        async with self._lock:
+            if self._stream is not None:
+                self._stream.stop()
+                self._stream.close()
+                self._stream = None
 
 class LaptopCamera:
     """
@@ -322,7 +345,7 @@ class LaptopPeripherals:
         )
 
     async def start(self) -> None:
-        pass
+        """Defer audio and camera capture until their buttons are held."""
 
     async def close(self) -> None:
         await self.audio_input.close()
@@ -332,7 +355,7 @@ class LaptopPeripherals:
         await self.camera_button.close()
 
 def create_peripherals(_settings: Settings) -> CompanionPeripherals:
-    "Implement and compose the laptop audio, camera, and button drivers."
+    """Build the laptop peripheral bundle used for mock development."""
     return LaptopPeripherals()
 
 

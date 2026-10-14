@@ -37,7 +37,7 @@ class Settings:
 
         model = os.getenv(
             "GEMINI_LIVE_MODEL",
-            "gemini_3.8_live",
+            "gemini-3.8-live",
         ).strip()
         if not model:
             raise ValueError("GEMINI_LIVE_MODEL must not be empty.")
@@ -45,5 +45,5 @@ class Settings:
         return cls(
             mode=mode,
             gemini_api_key=api_key,
-            gemini_live_model="gemini_3.8_live",
+            gemini_live_model=model,
         )
