@@ -1,6 +1,7 @@
 """Laptop webcam/microphone peripheral driver skeleton."""
 import platform
 import asyncio
+import logging
 import time
 import cv2
 
@@ -21,6 +22,8 @@ from interfaces import (
     CompanionPeripherals,
     VideoFrame,
 )
+
+logger = logging.getLogger(__name__)
 
 class LaptopAudioInput:
     """Laptop microphone driver for development testing."""
@@ -113,8 +116,13 @@ class LaptopAudioOutput:
     async def play(self, frame: AudioOutputFrame) -> None:
         """Play one audio frame through the laptop speaker."""
 
+        generation = self._generation
         async with self._lock:
-            generation = self._generation
+            # Drop frames that were already waiting to play when an interrupt
+            # arrived, rather than replaying stale Gemini audio afterward.
+            if generation != self._generation:
+                return
+
             if self._stream is None:
                 self._stream = sd.RawOutputStream(
                     samplerate=AUDIO_OUTPUT_SAMPLE_RATE_HZ,
@@ -132,27 +140,55 @@ class LaptopAudioOutput:
                 raise
 
     async def interrupt(self) -> None:
-        """Immediately abort queued speaker audio so a user can barge in."""
+        """Discard pending chunks and stop the speaker after its current write."""
         self._generation += 1
-        stream = self._stream
-        if stream is None:
-            return
-
-        await asyncio.to_thread(stream.abort)
-
+        # play() holds this lock until its blocking write completes. Waiting
+        # here avoids racing PortAudio abort against a write, which can cause
+        # driver errors and audible clicks/static.
         async with self._lock:
-            if self._stream is stream:
-                stream.close()
-                self._stream = None
+            stream = self._stream
+            if stream is None:
+                return
+
+            try:
+                try:
+                    await asyncio.to_thread(stream.stop)
+                except sd.PortAudioError as error:
+                    logger.warning(
+                        "PortAudio failed to stop interrupted speaker stream: %s",
+                        error,
+                    )
+            finally:
+                try:
+                    await asyncio.to_thread(stream.close)
+                except sd.PortAudioError as error:
+                    logger.warning(
+                        "PortAudio failed to close interrupted speaker stream: %s",
+                        error,
+                    )
+                finally:
+                    self._stream = None
 
     async def close(self) -> None:
         """Close the laptop speaker output."""
 
         async with self._lock:
-            if self._stream is not None:
-                self._stream.stop()
-                self._stream.close()
-                self._stream = None
+            stream = self._stream
+            if stream is None:
+                return
+
+            try:
+                try:
+                    await asyncio.to_thread(stream.stop)
+                except sd.PortAudioError as error:
+                    logger.warning("PortAudio failed to stop speaker stream: %s", error)
+            finally:
+                try:
+                    await asyncio.to_thread(stream.close)
+                except sd.PortAudioError as error:
+                    logger.warning("PortAudio failed to close speaker stream: %s", error)
+                finally:
+                    self._stream = None
 
 class LaptopCamera:
     """

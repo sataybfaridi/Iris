@@ -227,12 +227,11 @@ class LiveServiceTests(unittest.IsolatedAsyncioTestCase):
             receiver.cancel()
             await asyncio.gather(receiver, return_exceptions=True)
 
-    async def test_laptop_audio_output_interrupt_aborts_current_write(self) -> None:
+    async def test_laptop_audio_output_interrupt_waits_for_current_write(self) -> None:
         from peripherals.mock import LaptopAudioOutput
-        import sounddevice as sd
 
         write_started = threading.Event()
-        abort_write = threading.Event()
+        allow_write_to_finish = threading.Event()
         stream_closed = []
 
         class BlockingOutputStream:
@@ -243,19 +242,16 @@ class LiveServiceTests(unittest.IsolatedAsyncioTestCase):
 
             def write(self, pcm: bytes) -> None:
                 write_started.set()
-                abort_write.wait(timeout=2)
-                raise sd.PortAudioError("write aborted")
+                allow_write_to_finish.wait(timeout=2)
 
-            def abort(self) -> None:
-                abort_write.set()
+            def stop(self) -> None:
+                stream_stopped.append(True)
 
             def close(self) -> None:
                 stream_closed.append(True)
 
-            def stop(self) -> None:
-                pass
-
         output_stream = BlockingOutputStream()
+        stream_stopped = []
         output = LaptopAudioOutput()
         with patch("peripherals.mock.sd.RawOutputStream", return_value=output_stream):
             play_task = asyncio.create_task(
@@ -266,12 +262,73 @@ class LiveServiceTests(unittest.IsolatedAsyncioTestCase):
                 "Expected the speaker write to start.",
             )
 
-            await output.interrupt()
-            await play_task
+            interrupt_task = asyncio.create_task(output.interrupt())
+            await asyncio.sleep(0.01)
+            self.assertFalse(interrupt_task.done())
+            self.assertFalse(stream_stopped)
 
-        self.assertTrue(abort_write.is_set())
+            allow_write_to_finish.set()
+            await play_task
+            await interrupt_task
+
+        self.assertEqual(stream_stopped, [True])
         self.assertEqual(stream_closed, [True])
         self.assertIsNone(output._stream)
+
+    async def test_laptop_audio_output_recovers_from_interrupt_portaudio_errors(self) -> None:
+        from peripherals.mock import LaptopAudioOutput
+        import sounddevice as sd
+
+        class FailingOutputStream:
+            active = True
+
+            def start(self) -> None:
+                pass
+
+            def write(self, pcm: bytes) -> None:
+                pass
+
+            def stop(self) -> None:
+                raise sd.PortAudioError("stream already stopping")
+
+            def close(self) -> None:
+                raise sd.PortAudioError("stream already closed")
+
+        output = LaptopAudioOutput()
+        with patch(
+            "peripherals.mock.sd.RawOutputStream",
+            return_value=FailingOutputStream(),
+        ):
+            await output.play(AudioOutputFrame(pcm=b"\x01\x02"))
+            with self.assertLogs("peripherals.mock", level="WARNING") as logs:
+                await output.interrupt()
+
+        self.assertIsNone(output._stream)
+        self.assertEqual(len(logs.records), 2)
+        self.assertIn("failed to stop interrupted", logs.records[0].getMessage())
+        self.assertIn("failed to close", logs.records[1].getMessage())
+
+    async def test_laptop_audio_output_close_recovers_from_portaudio_errors(self) -> None:
+        from peripherals.mock import LaptopAudioOutput
+        import sounddevice as sd
+
+        class FailingOutputStream:
+            def stop(self) -> None:
+                raise sd.PortAudioError("stream already stopped")
+
+            def close(self) -> None:
+                raise sd.PortAudioError("stream already closed")
+
+        output = LaptopAudioOutput()
+        output._stream = FailingOutputStream()
+
+        with self.assertLogs("peripherals.mock", level="WARNING") as logs:
+            await output.close()
+
+        self.assertIsNone(output._stream)
+        self.assertEqual(len(logs.records), 2)
+        self.assertIn("failed to stop", logs.records[0].getMessage())
+        self.assertIn("failed to close", logs.records[1].getMessage())
 
     async def test_talk_button_starts_and_stops_capture(self) -> None:
         states = []
