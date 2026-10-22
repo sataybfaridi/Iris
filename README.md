@@ -20,6 +20,15 @@ Camera frames are sent at no more than one per second. Keyboard input uses
 `pynput`; on some operating systems, global keyboard monitoring may require
 accessibility permissions.
 
-Raspberry Pi hardware mode is not implemented yet: the factories in
-`peripherals/hardware.py` still raise `NotImplementedError`. Use
-`DEPLOYMENT_MODE=mock` until Pi-specific drivers are added.
+Raspberry Pi hardware mode uses the wired microphone/interface configured as
+the ALSA-default input,
+the MAX98357A as the ALSA-default I2S output, and the CSI-connected Camera
+Module 3 Wide. The provisional button wiring is active-low: talk on BCM GPIO17
+and camera on BCM GPIO27, with each button connecting its GPIO pin to ground.
+Update `TALK_BUTTON_GPIO` and `CAMERA_BUTTON_GPIO` in
+`peripherals/hardware.py` to match the device wiring.
+
+On Raspberry Pi OS, install Picamera2 from the OS packages (`sudo apt install
+python3-picamera2`) and use a Python environment that can import system
+packages. Configure the Pi's ALSA default capture/playback devices and enable
+the MAX98357A I2S overlay before starting with `DEPLOYMENT_MODE=hardware`.
