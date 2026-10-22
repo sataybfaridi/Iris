@@ -155,14 +155,55 @@ class HardwareDriverTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(streams[0].stopped)
         self.assertTrue(streams[0].closed)
 
-    async def test_pi_camera_lazily_imports_picamera2_and_yields_jpeg(self) -> None:
-        import numpy as np
+    async def test_hardware_module_import_does_not_require_opencv(self) -> None:
+        """Importing/creating peripherals must not load OpenCV (Pi BLAS issue)."""
+        import builtins
+        import importlib
 
+        real_import = builtins.__import__
+
+        def block_cv2(name, globals=None, locals=None, fromlist=(), level=0):
+            if name == "cv2" or name.startswith("cv2."):
+                raise ImportError(
+                    "libopenblas.so.0: cannot open shared object file: "
+                    "No such file or directory"
+                )
+            return real_import(name, globals, locals, fromlist, level)
+
+        gpiozero = types.ModuleType("gpiozero")
+
+        class FakeGPIOButton:
+            def __init__(self, *_args, **_kwargs):
+                self.when_pressed = None
+                self.when_released = None
+
+            def close(self) -> None:
+                pass
+
+        gpiozero.Button = FakeGPIOButton
+        settings = Settings(
+            mode=DeploymentMode.HARDWARE,
+            gemini_api_key="test-key",
+            gemini_live_model="test-model",
+        )
+
+        with patch.dict(sys.modules, {"gpiozero": gpiozero, "cv2": None}):
+            with patch.object(builtins, "__import__", block_cv2):
+                reloaded = importlib.reload(hardware)
+                peripherals = reloaded.create_peripherals(settings)
+                self.assertIsInstance(peripherals.camera, reloaded.PiCamera)
+                await peripherals.close()
+
+        # Restore the module under its normal import path for later tests.
+        importlib.reload(hardware)
+
+    async def test_pi_camera_captures_jpeg_without_opencv(self) -> None:
         class FakePicamera2:
             def __init__(self) -> None:
                 self.started = False
                 self.closed = False
                 self.config = None
+                self.capture_file_calls = 0
 
             def create_preview_configuration(self, main):
                 self.config = main
@@ -174,9 +215,15 @@ class HardwareDriverTests(unittest.IsolatedAsyncioTestCase):
             def start(self) -> None:
                 self.started = True
 
+            def capture_file(self, file_output, format=None) -> None:
+                self.capture_file_calls += 1
+                self.assert_format = format
+                file_output.write(b"\xff\xd8picamera-jpeg\xff\xd9")
+
             def capture_array(self):
-                # Minimal RGB frame; OpenCV encodes it to a valid JPEG.
-                return np.zeros((480, 640, 3), dtype=np.uint8)
+                raise AssertionError(
+                    "capture_array should not be used when capture_file works"
+                )
 
             def stop(self) -> None:
                 self.started = False
@@ -187,7 +234,74 @@ class HardwareDriverTests(unittest.IsolatedAsyncioTestCase):
         picamera2 = types.ModuleType("picamera2")
         picamera2.Picamera2 = FakePicamera2
 
-        with patch.dict(sys.modules, {"picamera2": picamera2}):
+        with patch.dict(sys.modules, {"picamera2": picamera2, "cv2": None}):
+            camera = hardware.PiCamera()
+            await camera.start_capture()
+            fake = camera._camera
+            frames = camera.frames()
+            frame = await asyncio.wait_for(anext(frames), timeout=2)
+            await camera.stop_capture()
+            await frames.aclose()
+            await camera.close()
+
+        self.assertEqual(fake.capture_file_calls, 1)
+        self.assertEqual(fake.assert_format, "jpeg")
+        self.assertEqual(frame.jpeg, b"\xff\xd8picamera-jpeg\xff\xd9")
+
+    async def test_pi_camera_falls_back_to_pillow_when_capture_file_unavailable(
+        self,
+    ) -> None:
+        class FakeImage:
+            def __init__(self, _array) -> None:
+                pass
+
+            def save(self, buffer, format=None) -> None:
+                if format != "JPEG":
+                    raise AssertionError(f"expected JPEG, got {format!r}")
+                buffer.write(b"\xff\xd8pillow-jpeg\xff\xd9")
+
+        class FakePicamera2:
+            def __init__(self) -> None:
+                self.started = False
+                self.closed = False
+
+            def create_preview_configuration(self, main):
+                return {"main": main}
+
+            def configure(self, config) -> None:
+                pass
+
+            def start(self) -> None:
+                self.started = True
+
+            def capture_file(self, file_output, format=None) -> None:
+                raise RuntimeError("JPEG still capture not configured")
+
+            def capture_array(self):
+                return [[[0, 0, 0]]]
+
+            def stop(self) -> None:
+                self.started = False
+
+            def close(self) -> None:
+                self.closed = True
+
+        picamera2 = types.ModuleType("picamera2")
+        picamera2.Picamera2 = FakePicamera2
+        pil = types.ModuleType("PIL")
+        pil_image = types.ModuleType("PIL.Image")
+        pil_image.fromarray = FakeImage
+        pil.Image = pil_image
+
+        with patch.dict(
+            sys.modules,
+            {
+                "picamera2": picamera2,
+                "PIL": pil,
+                "PIL.Image": pil_image,
+                "cv2": None,
+            },
+        ):
             camera = hardware.PiCamera()
             await camera.start_capture()
             frames = camera.frames()
@@ -196,5 +310,4 @@ class HardwareDriverTests(unittest.IsolatedAsyncioTestCase):
             await frames.aclose()
             await camera.close()
 
-        self.assertTrue(frame.jpeg.startswith(b"\xff\xd8"))
-        self.assertTrue(frame.jpeg.endswith(b"\xff\xd9"))
+        self.assertEqual(frame.jpeg, b"\xff\xd8pillow-jpeg\xff\xd9")

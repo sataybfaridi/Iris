@@ -32,3 +32,9 @@ On Raspberry Pi OS, install Picamera2 from the OS packages (`sudo apt install
 python3-picamera2`) and use a Python environment that can import system
 packages. Configure the Pi's ALSA default capture/playback devices and enable
 the MAX98357A I2S overlay before starting with `DEPLOYMENT_MODE=hardware`.
+
+Hardware mode does **not** load OpenCV to start peripherals or capture JPEG
+frames from the CSI camera (Picamera2 JPEG / Pillow). If you still use OpenCV
+elsewhere on the Pi (for example mock-mode webcam code) and see
+`libopenblas.so.0: cannot open shared object file`, install the runtime with
+`sudo apt install libopenblas0`.

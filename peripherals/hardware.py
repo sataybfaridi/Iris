@@ -10,11 +10,10 @@ Provisional assumptions (not confirmed final wiring or ALSA device names):
 from __future__ import annotations
 
 import asyncio
+import io
 import logging
 import time
 from typing import Optional
-
-import cv2
 
 from config import Settings
 from interfaces import (
@@ -144,13 +143,13 @@ class PiAudioOutput:
 
     async def interrupt(self) -> None:
         """Discard pending chunks and stop the speaker after its current write."""
-        import sounddevice as sd
-
         self._generation += 1
         async with self._lock:
             stream = self._stream
             if stream is None:
                 return
+
+            import sounddevice as sd
 
             try:
                 try:
@@ -173,12 +172,12 @@ class PiAudioOutput:
 
     async def close(self) -> None:
         """Close the speaker output stream."""
-        import sounddevice as sd
-
         async with self._lock:
             stream = self._stream
             if stream is None:
                 return
+
+            import sounddevice as sd
 
             try:
                 try:
@@ -194,6 +193,58 @@ class PiAudioOutput:
                     self._stream = None
 
 
+def _encode_rgb_array_as_jpeg(rgb) -> bytes:
+    """Encode an RGB array to JPEG without requiring OpenCV at import time.
+
+    Prefers Pillow. Falls back to a lazy OpenCV import only if Pillow is
+    unavailable; OpenCV on Raspberry Pi OS often needs ``libopenblas0``.
+    """
+    try:
+        from PIL import Image
+    except ImportError:
+        Image = None
+
+    if Image is not None:
+        buffer = io.BytesIO()
+        Image.fromarray(rgb).save(buffer, format="JPEG")
+        return buffer.getvalue()
+
+    try:
+        import cv2
+    except ImportError as error:
+        raise ImportError(
+            "JPEG encoding needs Pillow or OpenCV. Install Pillow "
+            "(`pip install pillow`) or, if using OpenCV on Raspberry Pi OS, "
+            "install the BLAS runtime with `sudo apt install libopenblas0` "
+            f"(original error: {error})"
+        ) from error
+
+    bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+    success, encoded = cv2.imencode(".jpg", bgr)
+    if not success:
+        raise RuntimeError("Could not encode camera frame as JPEG.")
+    return encoded.tobytes()
+
+
+def _capture_jpeg_from_picamera(camera) -> bytes:
+    """Capture one JPEG from Picamera2 without OpenCV.
+
+    Prefers Picamera2's built-in JPEG writer. Falls back to an RGB array
+    encoded with Pillow (or lazy OpenCV only if Pillow is missing).
+    """
+    buffer = io.BytesIO()
+    try:
+        camera.capture_file(buffer, format="jpeg")
+        jpeg = buffer.getvalue()
+        if jpeg.startswith(b"\xff\xd8") and jpeg.endswith(b"\xff\xd9"):
+            return jpeg
+    except (AttributeError, TypeError, ValueError, RuntimeError) as error:
+        logger.debug("Picamera2 JPEG capture_file unavailable: %s", error)
+
+    rgb = camera.capture_array()
+    return _encode_rgb_array_as_jpeg(rgb)
+
+
 class PiCamera:
     """CSI Camera Module 3 Wide via Picamera2, producing 640x480 JPEGs at ~1 FPS."""
 
@@ -202,7 +253,7 @@ class PiCamera:
         self._enabled = False
 
     async def start_capture(self) -> None:
-        """Turn the Pi camera on (lazy Picamera2 import)."""
+        """Turn the Pi camera on (lazy Picamera2 import; no OpenCV)."""
         if self._enabled:
             return
 
@@ -226,16 +277,11 @@ class PiCamera:
         interval = 1.0 / VIDEO_FRAMES_PER_SECOND
 
         while self._enabled:
-            rgb = await asyncio.to_thread(self._camera.capture_array)
+            jpeg = await asyncio.to_thread(_capture_jpeg_from_picamera, self._camera)
             if not self._enabled:
                 break
 
-            bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
-            success, encoded = cv2.imencode(".jpg", bgr)
-            if not success:
-                raise RuntimeError("Could not encode camera frame as JPEG.")
-
-            yield VideoFrame(jpeg=encoded.tobytes())
+            yield VideoFrame(jpeg=jpeg)
             await asyncio.sleep(interval)
 
     async def stop_capture(self) -> None:
