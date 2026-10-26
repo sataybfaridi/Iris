@@ -1,10 +1,20 @@
 """Function-based Gemini Live API transport skeleton."""
 
+import array
 import asyncio
+import math
+import time
 from collections.abc import Awaitable, Callable
 from typing import Any
 
-from config import Settings
+from config import DeploymentMode, Settings
+from vision_tools import (
+    VisionState,
+    build_camera_tools,
+    build_system_instruction,
+    handle_tool_call,
+    save_debug_frame,
+)
 from interfaces import (
     AUDIO_OUTPUT_SAMPLE_RATE_HZ,
     VIDEO_FRAMES_PER_SECOND,
@@ -24,8 +34,16 @@ async def run_gemini_live(
     client = genai.Client(api_key=settings.gemini_api_key)
     async with client.aio.live.connect(
         model=settings.gemini_live_model,
-                config=types.LiveConnectConfig(
+        config=types.LiveConnectConfig(
             response_modalities=["AUDIO"],
+            # Let Gemini see pictures at full quality (small label text).
+            media_resolution=types.MediaResolution.MEDIA_RESOLUTION_HIGH,
+            # Camera tools + rules. The laptop webcam faces you, so left and
+            # right are flipped; the Pi camera points away like a phone.
+            system_instruction=build_system_instruction(
+                camera_faces_user=settings.mode is DeploymentMode.MOCK
+            ),
+            tools=[build_camera_tools(types)],
             realtime_input_config=types.RealtimeInputConfig(
                 automatic_activity_detection=types.AutomaticActivityDetection(
                     disabled=True
@@ -42,9 +60,10 @@ async def stream_live_session(
     peripherals: CompanionPeripherals, session: Any
 ) -> None:
     """Run response and control tasks until one ends or the session fails."""
+    state = VisionState()
     tasks = (
-        asyncio.create_task(receive_live_responses(session, peripherals)),
-        asyncio.create_task(listen_for_button_events(peripherals, session)),
+        asyncio.create_task(receive_live_responses(session, peripherals, state)),
+        asyncio.create_task(listen_for_button_events(peripherals, session, state)),
     )
     try:
         done, _ = await asyncio.wait(
@@ -87,6 +106,19 @@ async def send_audio_frames(
         await session.send_realtime_input(audio=audio)
 
 
+# False = Gemini gets ONE fresh picture when you finish asking (plus the
+# zoom/refocus pictures), not a nonstop stream. With a nonstop stream Gemini
+# tends to latch onto an old frame. One picture per question is clearer,
+# cheaper and more private. The camera itself stays running so it's warm.
+STREAM_CAMERA_FRAMES = False
+
+
+async def keep_camera_running(peripherals: CompanionPeripherals) -> None:
+    """Keep the camera on (and warm) without sending anything to Gemini."""
+    async for _ in peripherals.camera.frames():
+        await asyncio.sleep(1 / VIDEO_FRAMES_PER_SECOND)
+
+
 async def send_video_frames(
     peripherals: CompanionPeripherals, session: Any
 ) -> None:
@@ -100,13 +132,15 @@ async def send_video_frames(
 
 
 async def receive_live_responses(
-    session: Any, peripherals: CompanionPeripherals
+    session: Any,
+    peripherals: CompanionPeripherals,
+    state: VisionState | None = None,
 ) -> None:
     """Receive model events independently from speaker playback."""
     audio_queue: asyncio.Queue[AudioOutputFrame] = asyncio.Queue()
     tasks = (
         asyncio.create_task(
-            receive_live_events(session, peripherals, audio_queue),
+            receive_live_events(session, peripherals, audio_queue, state),
             name="gemini-live-receiver",
         ),
         asyncio.create_task(
@@ -137,8 +171,12 @@ async def receive_live_events(
     session: Any,
     peripherals: CompanionPeripherals,
     audio_queue: asyncio.Queue[AudioOutputFrame],
+    state: VisionState | None = None,
 ) -> None:
     """Receive complete model turns continuously and enqueue their audio."""
+    if state is None:
+        state = VisionState()
+    tool_tasks: set[asyncio.Task] = set()
     speaking = False
     while True:
         # The SDK receive iterator finishes after one complete model turn.
@@ -147,16 +185,38 @@ async def receive_live_events(
         received_response = False
         async for response in session.receive():
             received_response = True
+
+            # Gemini asked to zoom/refocus. Run it in the background so we
+            # keep receiving (camera work can take a second or two).
+            tool_call = getattr(response, "tool_call", None)
+            if tool_call is not None:
+                task = asyncio.create_task(
+                    handle_tool_call(tool_call, session, peripherals.camera, state)
+                )
+                tool_tasks.add(task)
+                task.add_done_callback(_finish_tool_task(tool_tasks))
+                continue
+
             speaking = await handle_live_response(
                 response,
                 peripherals,
                 audio_queue,
                 speaking=speaking,
             )
+
         if not received_response:
             raise RuntimeError(
                 "Gemini Live response stream ended without a response."
             )
+
+
+def _finish_tool_task(tool_tasks: set):
+    def done(task: asyncio.Task) -> None:
+        tool_tasks.discard(task)
+        if not task.cancelled() and task.exception() is not None:
+            print(f"[Vision] Camera tool failed: {task.exception()}", flush=True)
+
+    return done
 
 
 async def play_queued_audio(
@@ -234,11 +294,119 @@ async def handle_live_response(
     return speaking
 
 
+# Told to Gemini at the start of every question, so it always knows if it
+# has a live picture. Without this, when the camera is off Gemini keeps
+# describing old pictures it still remembers.
+CAMERA_ON_NOTE = (
+    "[Camera note: the camera is ON. Pictures sent during this question are "
+    "live. Answer only from them.]"
+)
+CAMERA_OFF_NOTE = (
+    "[Camera note: the camera is OFF. You have NO current picture. Do not "
+    "describe anything from earlier pictures. If this question needs the "
+    "camera, ask the user to press the camera button.]"
+)
+
+# Taps shorter than this get padded with silence (see end_talking).
+MIN_TALK_S = 1.0
+# 0.5 s of silence: 16 kHz, mono, 16-bit = 2 bytes per sample.
+SILENCE_PCM = bytes(16000 * 2 // 2)
+
+
 async def listen_for_button_events(
-    peripherals: CompanionPeripherals, session: Any
+    peripherals: CompanionPeripherals,
+    session: Any,
+    state: VisionState | None = None,
 ) -> None:
-    """Use Space to talk and hold C to share camera frames."""
+    """Hold Space to talk. Press C once to turn the camera on, again to turn it off."""
     from google.genai import types
+
+    if state is None:
+        state = VisionState()
+    background: set[asyncio.Task] = set()
+
+    question_streamer: asyncio.Task | None = None
+    talk_started = 0.0
+    told_camera_on = False
+
+    async def tell_camera_on() -> None:
+        """Camera turned on mid-question: tell Gemini before the first picture."""
+        nonlocal told_camera_on
+        if not told_camera_on:
+            told_camera_on = True
+            await session.send_realtime_input(text=CAMERA_ON_NOTE)
+
+    async def send_picture(label: str | None = None) -> bool:
+        """Send one fresh camera picture to Gemini (if the camera is on)."""
+        if not getattr(peripherals.camera, "is_on", False):
+            return False
+        fresh = getattr(peripherals.camera, "_fresh_frame", None)
+        if fresh is None:
+            return False
+        frame = await fresh()
+        if frame is None:
+            return False
+        if label is not None:
+            save_debug_frame(frame, label)
+        await tell_camera_on()
+        await session.send_realtime_input(
+            video=types.Blob(data=frame.jpeg, mime_type="image/jpeg")
+        )
+        return True
+
+    async def stream_question_pictures() -> None:
+        """While the user is talking, send a picture every second.
+
+        Gemini uses pictures that arrive DURING the question. A single
+        picture sent right as the user lets go of Talk gets ignored.
+        """
+        try:
+            while True:
+                await send_picture()
+                await asyncio.sleep(1 / VIDEO_FRAMES_PER_SECOND)
+        except asyncio.CancelledError:
+            pass
+
+    async def start_talking() -> None:
+        nonlocal question_streamer, talk_started, told_camera_on
+        talk_started = time.monotonic()
+        await session.send_realtime_input(activity_start=types.ActivityStart())
+        # Tell Gemini right away whether it has a live picture.
+        told_camera_on = bool(getattr(peripherals.camera, "is_on", False))
+        await session.send_realtime_input(
+            text=CAMERA_ON_NOTE if told_camera_on else CAMERA_OFF_NOTE
+        )
+        # New question: camera back to 1x and retry limits reset.
+        state.reset_view()
+        state.touch()  # keeps the camera from auto-turning-off mid-use
+        new_question = getattr(peripherals.camera, "new_question", None)
+        if new_question is not None:
+            await new_question()
+        # Send pictures while the user asks. Runs even if the camera is off,
+        # so turning it on mid-question still works (send_picture skips
+        # while it's off).
+        question_streamer = asyncio.create_task(stream_question_pictures())
+
+    async def end_talking() -> None:
+        nonlocal question_streamer
+        if question_streamer is not None:
+            question_streamer.cancel()
+            await asyncio.gather(question_streamer, return_exceptions=True)
+            question_streamer = None
+        # One last picture of the view when the question ends, then give
+        # Gemini a moment to take it in before it starts answering.
+        if await send_picture(label="question"):
+            print("[Vision] Sent pictures with your question.", flush=True)
+            await asyncio.sleep(0.3)
+        # Very quick tap = almost no audio in the question. Gemini rejects
+        # that (error 1007 "Precondition check failed") and closes the
+        # connection, so pad the question with a little silence.
+        if time.monotonic() - talk_started < MIN_TALK_S:
+            await session.send_realtime_input(
+                audio=types.Blob(data=SILENCE_PCM, mime_type="audio/pcm;rate=16000")
+            )
+        await session.send_realtime_input(activity_end=types.ActivityEnd())
+
     tasks = (
         asyncio.create_task(
             listen_for_capture_button(
@@ -247,21 +415,19 @@ async def listen_for_button_events(
                 peripherals.audio_input.stop_capture,
                 lambda: send_audio_frames(peripherals, session),
                 status_label="Listening (sending microphone audio)",
-                on_capture_started=lambda: session.send_realtime_input(
-                    activity_start=types.ActivityStart()
-                ),
-                on_capture_stopped=lambda: session.send_realtime_input(
-                    activity_end=types.ActivityEnd()
-                ),
+                on_capture_started=start_talking,
+                on_capture_stopped=end_talking,
             )
         ),
         asyncio.create_task(
-            listen_for_capture_button(
+            listen_for_camera_toggle(
                 peripherals.camera_button,
-                peripherals.camera.start_capture,
-                peripherals.camera.stop_capture,
-                lambda: send_video_frames(peripherals, session),
-                status_label="Sending camera frames",
+                peripherals.camera,
+                (lambda: send_video_frames(peripherals, session))
+                if STREAM_CAMERA_FRAMES
+                else (lambda: keep_camera_running(peripherals)),
+                state,
+                play_sound=lambda pcm: _play_sound(peripherals, pcm, background),
             )
         ),
     )
@@ -274,6 +440,8 @@ async def listen_for_button_events(
             task.result()
         raise RuntimeError("A peripheral button event stream ended unexpectedly.")
     finally:
+        if question_streamer is not None:
+            question_streamer.cancel()
         for task in tasks:
             if not task.done():
                 task.cancel()
@@ -338,3 +506,122 @@ async def listen_for_capture_button(
             await stop_capture()
             if not sender.done():
                 await sender
+
+
+# ============================================================
+# Camera toggle: press C once = on, press again = off
+# ============================================================
+
+# Camera turns itself off after this long with no questions, so it doesn't
+# drain the battery or keep sending pictures if the user forgets it's on.
+CAMERA_AUTO_OFF_S = 60.0
+
+
+def make_beep(frequency_hz: float, duration_s: float = 0.12, volume: float = 0.25) -> bytes:
+    """A short beep as 24 kHz mono 16-bit PCM (same format as Gemini's audio)."""
+    rate = AUDIO_OUTPUT_SAMPLE_RATE_HZ
+    count = int(rate * duration_s)
+    fade = max(1, int(rate * 0.01))  # 10 ms fade in/out so it doesn't click
+    samples = array.array("h")
+    for i in range(count):
+        envelope = min(1.0, i / fade, (count - 1 - i) / fade)
+        value = volume * envelope * math.sin(2 * math.pi * frequency_hz * i / rate)
+        samples.append(int(value * 32767))
+    return samples.tobytes()
+
+
+CAMERA_ON_BEEP = make_beep(1200) + make_beep(1600)   # rising = on
+CAMERA_OFF_BEEP = make_beep(900) + make_beep(600)    # falling = off
+
+
+def _play_sound(peripherals: CompanionPeripherals, pcm: bytes, background: set) -> None:
+    """Play a beep without waiting for it to finish."""
+    task = asyncio.create_task(peripherals.audio_output.play(AudioOutputFrame(pcm=pcm)))
+    background.add(task)
+    task.add_done_callback(background.discard)
+
+
+async def listen_for_camera_toggle(
+    button: Button,
+    camera: Any,
+    send_frames: Callable[[], Awaitable[None]],
+    state: VisionState,
+    play_sound: Callable[[bytes], None] | None = None,
+    auto_off_s: float = CAMERA_AUTO_OFF_S,
+) -> None:
+    """Press C: camera on (rising beep). Press C again: off (falling beep).
+
+    Also turns off by itself after auto_off_s with no questions.
+    """
+    events = button.events().__aiter__()
+    next_event = asyncio.create_task(anext(events))
+    sender: asyncio.Task[None] | None = None
+
+    async def turn_on() -> None:
+        nonlocal sender
+        await camera.start_capture()
+        sender = asyncio.create_task(send_frames())
+        state.touch()
+        if play_sound is not None:
+            play_sound(CAMERA_ON_BEEP)
+        print("[Live] Camera ON.", flush=True)
+
+    async def turn_off(reason: str) -> None:
+        nonlocal sender
+        await camera.stop_capture()
+        if sender is not None:
+            try:
+                await asyncio.wait_for(sender, timeout=3)
+            except Exception as error:  # a stuck/failed sender shouldn't crash IRIS
+                print(f"[Live] Camera sender stopped with: {error!r}", flush=True)
+            sender = None
+        if play_sound is not None:
+            play_sound(CAMERA_OFF_BEEP)
+        print(f"[Live] Camera OFF ({reason}).", flush=True)
+
+    try:
+        while True:
+            waiting = {next_event}
+            timeout = None
+            if sender is not None:
+                waiting.add(sender)
+                timeout = max(0.0, state.last_activity + auto_off_s - time.monotonic())
+
+            done, _ = await asyncio.wait(
+                waiting, timeout=timeout, return_when=asyncio.FIRST_COMPLETED
+            )
+
+            # Nothing happened for a while: auto-off.
+            if not done:
+                if time.monotonic() - state.last_activity >= auto_off_s:
+                    await turn_off("no questions for a while")
+                continue
+
+            if next_event in done:
+                event = next_event.result()
+                next_event = asyncio.create_task(anext(events))
+                # Only the press counts; letting go of C does nothing.
+                if event.pressed:
+                    if sender is None:
+                        await turn_on()
+                    else:
+                        await turn_off("button")
+                continue
+
+            # The picture stream stopped on its own (camera problem).
+            if sender is not None and sender in done:
+                error = None if sender.cancelled() else sender.exception()
+                sender = None
+                print(f"[Live] Camera stream stopped: {error!r}", flush=True)
+                await camera.stop_capture()
+                if play_sound is not None:
+                    play_sound(CAMERA_OFF_BEEP)
+    finally:
+        if not next_event.done():
+            next_event.cancel()
+        await asyncio.gather(next_event, return_exceptions=True)
+        if sender is not None:
+            await camera.stop_capture()
+            if not sender.done():
+                sender.cancel()
+            await asyncio.gather(sender, return_exceptions=True)
