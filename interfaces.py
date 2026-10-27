@@ -8,8 +8,8 @@ AUDIO_INPUT_SAMPLE_RATE_HZ = 16_000
 AUDIO_OUTPUT_SAMPLE_RATE_HZ = 24_000
 AUDIO_CHANNELS = 1
 AUDIO_SAMPLE_WIDTH_BYTES = 2
-VIDEO_FRAME_WIDTH = 640
-VIDEO_FRAME_HEIGHT = 480
+VIDEO_FRAME_WIDTH = 1280
+VIDEO_FRAME_HEIGHT = 720
 VIDEO_FRAMES_PER_SECOND = 1
 
 
@@ -45,7 +45,7 @@ class AudioOutputFrame:
 
 @dataclass(frozen=True)
 class VideoFrame:
-    """A complete JPEG image downscaled to 640x480 before delivery."""
+    """A complete JPEG image downscaled to 1280x720 before delivery."""
 
     jpeg: bytes
 
