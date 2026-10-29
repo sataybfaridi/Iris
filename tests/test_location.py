@@ -12,22 +12,22 @@ dotenv_stub.load_dotenv = lambda: None
 sys.modules.setdefault("dotenv", dotenv_stub)
 
 import config
-from directions import (
+from interfaces import LocationFix
+from location.directions import (
     ROUTES_URL,
     parse_directions,
     plain_instruction,
     routes_request_body,
     walking_directions,
 )
-from places import (
+from location.places import (
     PLACES_URL,
     clean_place_query,
     nearby_place,
     nearby_request_body,
     parse_nearby_place,
 )
-from interfaces import LocationFix
-from location_tools import run_location_tool
+from location.tools import run_location_tool
 from peripherals.mock import LaptopLocation, create_peripherals
 
 
@@ -262,11 +262,60 @@ class LocationTests(unittest.IsolatedAsyncioTestCase):
         environment = {
             "DEPLOYMENT_MODE": "hardware",
             "GEMINI_API_KEY": "test-key",
+            "GOOGLE_MAPS_API_KEY": "maps-key",
+            "GPS_SERIAL_PORT": "/dev/ttyAMA0",
+            "GPS_BAUD_RATE": "9600",
         }
         with patch.dict(os.environ, environment, clear=True):
             settings = config.Settings.from_env()
         self.assertIsNone(settings.mock_latitude)
-        self.assertEqual(settings.google_maps_api_key, "")
+        self.assertEqual(settings.google_maps_api_key, "maps-key")
+        self.assertEqual(settings.gps_serial_port, "/dev/ttyAMA0")
+        self.assertEqual(settings.gps_baud_rate, 9600)
+
+    def test_hardware_mode_requires_maps_key(self) -> None:
+        environment = {
+            "DEPLOYMENT_MODE": "hardware",
+            "GEMINI_API_KEY": "test-key",
+            # Explicit empty so load_dotenv() cannot refill from a local .env.
+            "GOOGLE_MAPS_API_KEY": "",
+        }
+        with patch.dict(os.environ, environment, clear=True):
+            with self.assertRaises(ValueError):
+                config.Settings.from_env()
+
+    def test_parse_directions_keeps_step_polylines(self) -> None:
+        fixture = {
+            "routes": [
+                {
+                    "distanceMeters": 200,
+                    "duration": "120s",
+                    "legs": [
+                        {
+                            "distanceMeters": 200,
+                            "duration": "120s",
+                            "steps": [
+                                {
+                                    "distanceMeters": 200,
+                                    "staticDuration": "120s",
+                                    "navigationInstruction": {
+                                        "instructions": "Head north"
+                                    },
+                                    "polyline": {
+                                        "encodedPolyline": "_p~iF~ps|U_ulLnnqC"
+                                    },
+                                }
+                            ],
+                        }
+                    ],
+                }
+            ],
+        }
+        result = parse_directions(fixture, "the pharmacy")
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(
+            result["steps"][0]["encoded_polyline"], "_p~iF~ps|U_ulLnnqC"
+        )
 
 
 if __name__ == "__main__":

@@ -12,6 +12,10 @@ class DeploymentMode(str, Enum):
     HARDWARE = "hardware"
 
 
+DEFAULT_GPS_SERIAL_PORT = "/dev/serial0"
+DEFAULT_GPS_BAUD_RATE = 9600
+
+
 def _required_float(name: str, low: float, high: float) -> float:
     raw = os.getenv(name, "").strip()
     if not raw:
@@ -27,6 +31,17 @@ def _required_float(name: str, low: float, high: float) -> float:
     return value
 
 
+def _gps_baud_rate() -> int:
+    raw = os.getenv("GPS_BAUD_RATE", str(DEFAULT_GPS_BAUD_RATE)).strip()
+    try:
+        value = int(raw)
+    except ValueError as error:
+        raise ValueError("GPS_BAUD_RATE must be an integer.") from error
+    if value <= 0:
+        raise ValueError("GPS_BAUD_RATE must be greater than zero.")
+    return value
+
+
 @dataclass(frozen=True)
 class Settings:
     mode: DeploymentMode
@@ -36,6 +51,8 @@ class Settings:
     mock_longitude: float | None = None
     mock_location_accuracy_meters: float | None = None
     google_maps_api_key: str = ""
+    gps_serial_port: str = DEFAULT_GPS_SERIAL_PORT
+    gps_baud_rate: int = DEFAULT_GPS_BAUD_RATE
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -65,6 +82,9 @@ class Settings:
         mock_longitude = None
         mock_accuracy = None
         maps_key = os.getenv("GOOGLE_MAPS_API_KEY", "").strip()
+        gps_port = DEFAULT_GPS_SERIAL_PORT
+        gps_baud = DEFAULT_GPS_BAUD_RATE
+
         if mode is DeploymentMode.MOCK:
             mock_latitude = _required_float("MOCK_LATITUDE", -90, 90)
             mock_longitude = _required_float("MOCK_LONGITUDE", -180, 180)
@@ -74,6 +94,17 @@ class Settings:
                     "GOOGLE_MAPS_API_KEY must be set before starting the "
                     "companion in mock mode."
                 )
+        elif mode is DeploymentMode.HARDWARE:
+            if not maps_key:
+                raise ValueError(
+                    "GOOGLE_MAPS_API_KEY must be set before starting the "
+                    "companion in hardware mode."
+                )
+            gps_port = (
+                os.getenv("GPS_SERIAL_PORT", DEFAULT_GPS_SERIAL_PORT).strip()
+                or DEFAULT_GPS_SERIAL_PORT
+            )
+            gps_baud = _gps_baud_rate()
 
         return cls(
             mode=mode,
@@ -83,4 +114,6 @@ class Settings:
             mock_longitude=mock_longitude,
             mock_location_accuracy_meters=mock_accuracy,
             google_maps_api_key=maps_key,
+            gps_serial_port=gps_port,
+            gps_baud_rate=gps_baud,
         )

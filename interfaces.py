@@ -142,6 +142,8 @@ class Button(Protocol):
 class Location(Protocol):
     async def current_fix(self) -> LocationFix: ...
 
+    async def close(self) -> None: ...
+
 
 @runtime_checkable
 class CompanionPeripherals(Protocol):

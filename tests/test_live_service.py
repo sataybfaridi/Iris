@@ -14,10 +14,9 @@ dotenv_stub.load_dotenv = lambda: None
 sys.modules.setdefault("dotenv", dotenv_stub)
 
 import config
-import directions
-import gemini_service
-import location_tools
+from gemini import service as gemini_service
 from interfaces import AudioInputFrame, AudioOutputFrame, LocationFix
+from location import directions, tools as location_tools
 
 
 class FakeBlob:
@@ -442,6 +441,11 @@ class LiveServiceTests(unittest.IsolatedAsyncioTestCase):
         environment = {
             "DEPLOYMENT_MODE": "mock",
             "GEMINI_API_KEY": "test-key",
+            # Explicit empties so load_dotenv() cannot refill from a local .env.
+            "MOCK_LATITUDE": "",
+            "MOCK_LONGITUDE": "",
+            "MOCK_LOCATION_ACCURACY_METERS": "",
+            "GOOGLE_MAPS_API_KEY": "",
         }
         with patch.dict(os.environ, environment, clear=True):
             with self.assertRaises(ValueError):

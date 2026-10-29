@@ -7,10 +7,18 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
-import navigation
 from interfaces import LocationFix
-from location_tools import handle_location_tool_call, navigation_payload
-from navigation import FIVE_FEET_METERS, NavigationController, TurnGuide
+from location import navigation
+from location.navigation import (
+    FIVE_FEET_METERS,
+    OFF_ROUTE_CUE,
+    NavigationController,
+    RouteGeometry,
+    TurnGuide,
+    decode_polyline,
+    haversine_meters,
+)
+from location.tools import handle_location_tool_call, navigation_payload
 
 
 class TurnGuideTests(unittest.TestCase):
@@ -164,7 +172,7 @@ class NavigationSessionTests(unittest.IsolatedAsyncioTestCase):
                 sys.modules,
                 {"google": google_module, "google.genai": genai_module},
             ),
-            patch("directions._http_post_json", return_value=fixture),
+            patch("location.directions._http_post_json", return_value=fixture),
         ):
             await handle_location_tool_call(
                 tool_call, session, Location(), "maps-key", navigator
@@ -175,6 +183,134 @@ class NavigationSessionTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("steps", response)
         self.assertEqual(navigator.steps[0]["instruction"], "Head north")
         self.assertEqual(navigator.steps[0]["distance_meters"], 200)
+
+
+class RouteGeometryTests(unittest.TestCase):
+    def test_decode_polyline_round_trip_sample(self) -> None:
+        # Google's documented sample fragment for (38.5, -120.2) -> (40.7, -120.95).
+        points = decode_polyline("_p~iF~ps|U_ulLnnqC")
+        self.assertEqual(len(points), 2)
+        self.assertAlmostEqual(points[0][0], 38.5, places=5)
+        self.assertAlmostEqual(points[0][1], -120.2, places=5)
+
+    def test_project_is_monotonic_along_a_straight_route(self) -> None:
+        geometry = RouteGeometry([(37.0, -122.0), (37.001, -122.0), (37.002, -122.0)])
+        along_a, distance_a = geometry.project(37.0005, -122.0)
+        along_b, distance_b = geometry.project(37.0015, -122.0)
+        self.assertLess(distance_a, 2.0)
+        self.assertLess(distance_b, 2.0)
+        self.assertGreater(along_b, along_a)
+        self.assertGreater(
+            haversine_meters(37.0, -122.0, 37.002, -122.0),
+            100,
+        )
+
+
+class GpsNavigationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_gps_progress_warns_then_turns_without_rewinding(self) -> None:
+        spoken = []
+
+        async def speak(phrase: str) -> None:
+            spoken.append(phrase)
+
+        class MovingLocation:
+            def __init__(self) -> None:
+                self.fixes = [
+                    LocationFix(37.0, -122.0, 5, timestamp=1),
+                    LocationFix(37.00004, -122.0, 5, timestamp=2),
+                    LocationFix(37.00008, -122.0, 5, timestamp=3),
+                    LocationFix(37.00012, -122.0, 5, timestamp=4),
+                ]
+                self.index = 0
+
+            async def current_fix(self) -> LocationFix:
+                fix = self.fixes[min(self.index, len(self.fixes) - 1)]
+                self.index += 1
+                return fix
+
+            async def close(self) -> None:
+                return None
+
+        geometry_points = [(37.0, -122.0), (37.00015, -122.0)]
+        steps = [
+            {
+                "instruction": "Head north",
+                "distance_meters": 10,
+                "encoded_polyline": "",
+            },
+            {
+                "instruction": "Turn left",
+                "distance_meters": 6,
+                "encoded_polyline": "",
+            },
+        ]
+        location = MovingLocation()
+        controller = NavigationController(
+            speak, location=location, use_gps=True
+        )
+
+        def fake_from_steps(_steps):
+            return RouteGeometry(geometry_points)
+
+        with (
+            patch.object(navigation, "TICK_SECONDS", 0.01),
+            patch.object(
+                navigation.RouteGeometry, "from_route_steps", fake_from_steps
+            ),
+        ):
+            first = controller.start(steps)
+            for _ in range(80):
+                if "Turn left" in spoken or OFF_ROUTE_CUE in spoken:
+                    break
+                await asyncio.sleep(0.01)
+            controller.cancel()
+
+        self.assertEqual(first, "Head north")
+        self.assertNotIn("Head north", spoken)
+        self.assertLessEqual(spoken.count("In 5 feet, turn left"), 1)
+        self.assertIn("Turn left", spoken)
+
+    async def test_off_route_cancels_with_one_cue(self) -> None:
+        spoken = []
+
+        async def speak(phrase: str) -> None:
+            spoken.append(phrase)
+
+        class FarLocation:
+            async def current_fix(self) -> LocationFix:
+                return LocationFix(37.1, -122.0, 5, timestamp=1)
+
+            async def close(self) -> None:
+                return None
+
+        steps = [
+            {
+                "instruction": "Head north",
+                "distance_meters": 50,
+                "encoded_polyline": "_p~iF~ps|U_ulLnnqC",
+            }
+        ]
+        controller = NavigationController(
+            speak, location=FarLocation(), use_gps=True
+        )
+
+        def fake_from_steps(_steps):
+            return RouteGeometry([(37.0, -122.0), (37.001, -122.0)])
+
+        with (
+            patch.object(navigation, "TICK_SECONDS", 0.01),
+            patch.object(
+                navigation.RouteGeometry, "from_route_steps", fake_from_steps
+            ),
+        ):
+            controller.start(steps)
+            for _ in range(40):
+                if OFF_ROUTE_CUE in spoken:
+                    break
+                await asyncio.sleep(0.01)
+            controller.cancel()
+
+        self.assertEqual(spoken.count(OFF_ROUTE_CUE), 1)
 
 
 if __name__ == "__main__":

@@ -1,8 +1,8 @@
 """Location tools Gemini can call: the current fix, nearby places, and walking directions.
 
 The camera stays a separate tool. These read CompanionPeripherals.location.
-Directions use directions.py. A nearest-place question uses places.py first,
-then the walking route to that address.
+Directions use location.directions. A nearest-place question uses
+location.places first, then the walking route to that address.
 """
 
 from __future__ import annotations
@@ -10,9 +10,9 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from directions import walking_directions
 from interfaces import Location, LocationFix
-from places import nearby_place
+from location.directions import walking_directions
+from location.places import nearby_place
 
 
 logger = logging.getLogger(__name__)

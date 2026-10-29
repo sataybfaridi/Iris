@@ -31,6 +31,9 @@ class HardwareDriverTests(unittest.IsolatedAsyncioTestCase):
             mode=DeploymentMode.HARDWARE,
             gemini_api_key="test-key",
             gemini_live_model="test-model",
+            google_maps_api_key="maps-key",
+            gps_serial_port="/dev/gps-test",
+            gps_baud_rate=9600,
         )
 
         with patch.dict(sys.modules, {"gpiozero": gpiozero}):
@@ -39,6 +42,9 @@ class HardwareDriverTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsInstance(peripherals.audio_input, hardware.PiAudioInput)
         self.assertIsInstance(peripherals.audio_output, hardware.PiAudioOutput)
         self.assertIsInstance(peripherals.camera, hardware.PiCamera)
+        self.assertIsInstance(peripherals.location, hardware.NeoM8NLocation)
+        self.assertEqual(peripherals.location._port, "/dev/gps-test")
+        self.assertEqual(peripherals.location._baud_rate, 9600)
         self.assertEqual(
             [device.pin for device in created_buttons],
             [hardware.TALK_BUTTON_GPIO, hardware.CAMERA_BUTTON_GPIO],
@@ -47,8 +53,11 @@ class HardwareDriverTests(unittest.IsolatedAsyncioTestCase):
             [device.pull_up for device in created_buttons],
             [True, True],
         )
-        with self.assertRaisesRegex(RuntimeError, "GPS is not available"):
-            await peripherals.location.current_fix()
+        peripherals.location.apply_nmea_for_tests(
+            "$GPGGA,123519,4807.038,N,01131.000,E,1,08,0.9,545.4,M,46.9,M,,*47"
+        )
+        fix = await peripherals.location.current_fix()
+        self.assertAlmostEqual(fix.latitude, 48.1173, places=4)
         await peripherals.close()
 
     async def test_gpio_button_publishes_async_press_and_release_events(self) -> None:
@@ -187,6 +196,9 @@ class HardwareDriverTests(unittest.IsolatedAsyncioTestCase):
             mode=DeploymentMode.HARDWARE,
             gemini_api_key="test-key",
             gemini_live_model="test-model",
+            google_maps_api_key="maps-key",
+            gps_serial_port="/dev/gps-test",
+            gps_baud_rate=9600,
         )
 
         with patch.dict(sys.modules, {"gpiozero": gpiozero, "cv2": None}):
@@ -194,6 +206,7 @@ class HardwareDriverTests(unittest.IsolatedAsyncioTestCase):
                 reloaded = importlib.reload(hardware)
                 peripherals = reloaded.create_peripherals(settings)
                 self.assertIsInstance(peripherals.camera, reloaded.PiCamera)
+                self.assertIsInstance(peripherals.location, reloaded.NeoM8NLocation)
                 await peripherals.close()
 
         # Restore the module under its normal import path for later tests.

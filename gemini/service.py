@@ -8,13 +8,20 @@ from collections.abc import Awaitable, Callable
 from typing import Any
 
 from config import DeploymentMode, Settings
-from location_tools import (
+from interfaces import (
+    AUDIO_OUTPUT_SAMPLE_RATE_HZ,
+    VIDEO_FRAMES_PER_SECOND,
+    AudioOutputFrame,
+    Button,
+    CompanionPeripherals,
+)
+from location.navigation import NavigationController
+from location.tools import (
     LOCATION_TOOL_NAMES,
     build_location_tools,
     handle_location_tool_call,
 )
-from navigation import NavigationController
-from vision_tools import (
+from vision.tools import (
     FOCUS_TOOL,
     VisionState,
     ZOOM_TOOL,
@@ -22,13 +29,6 @@ from vision_tools import (
     build_system_instruction,
     handle_tool_call,
     save_debug_frame,
-)
-from interfaces import (
-    AUDIO_OUTPUT_SAMPLE_RATE_HZ,
-    VIDEO_FRAMES_PER_SECOND,
-    AudioOutputFrame,
-    Button,
-    CompanionPeripherals,
 )
 
 
@@ -62,7 +62,10 @@ async def run_gemini_live(
         ),
     ) as session:
         await stream_live_session(
-            peripherals, session, settings.google_maps_api_key
+            peripherals,
+            session,
+            settings.google_maps_api_key,
+            use_gps=settings.mode is DeploymentMode.HARDWARE,
         )
 
 
@@ -70,6 +73,8 @@ async def stream_live_session(
     peripherals: CompanionPeripherals,
     session: Any,
     maps_api_key: str = "",
+    *,
+    use_gps: bool = False,
 ) -> None:
     """Run response and control tasks until one ends or the session fails."""
     state = VisionState()
@@ -78,6 +83,8 @@ async def stream_live_session(
     navigator = NavigationController(
         lambda phrase: speak_navigation_cue(session, phrase),
         idle=user_idle,
+        location=peripherals.location,
+        use_gps=use_gps,
     )
     tasks = (
         asyncio.create_task(

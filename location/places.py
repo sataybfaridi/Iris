@@ -9,8 +9,8 @@ from typing import Any
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
-from directions import walking_directions
 from interfaces import LocationFix
+from location.directions import walking_directions
 
 
 PLACES_URL = "https://places.googleapis.com/v1/places:searchText"

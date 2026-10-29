@@ -19,7 +19,8 @@ _FIELD_MASK = (
     "routes.duration,routes.distanceMeters,"
     "routes.legs.duration,routes.legs.distanceMeters,"
     "routes.legs.steps.distanceMeters,routes.legs.steps.staticDuration,"
-    "routes.legs.steps.navigationInstruction"
+    "routes.legs.steps.navigationInstruction,"
+    "routes.legs.steps.polyline.encodedPolyline"
 )
 _TAGS = re.compile(r"<[^>]+>")
 
@@ -134,16 +135,21 @@ def parse_directions(payload: Any, destination: str) -> dict[str, Any]:
             distance_meters = float(meters) if meters is not None else 0.0
         except (TypeError, ValueError):
             distance_meters = 0.0
-        steps.append(
-            {
-                "instruction": instruction,
-                "distance_meters": max(distance_meters, 0.0),
-                "distance": _spoken_distance(step.get("distanceMeters")),
-                "duration": _spoken_duration(
-                    step.get("staticDuration") or step.get("duration")
-                ),
-            }
-        )
+        encoded = ""
+        polyline = step.get("polyline")
+        if isinstance(polyline, dict):
+            encoded = str(polyline.get("encodedPolyline") or "")
+        entry = {
+            "instruction": instruction,
+            "distance_meters": max(distance_meters, 0.0),
+            "distance": _spoken_distance(step.get("distanceMeters")),
+            "duration": _spoken_duration(
+                step.get("staticDuration") or step.get("duration")
+            ),
+        }
+        if encoded:
+            entry["encoded_polyline"] = encoded
+        steps.append(entry)
     if not steps:
         return {
             "status": "error",

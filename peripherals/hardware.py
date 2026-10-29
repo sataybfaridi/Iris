@@ -5,6 +5,7 @@ Provisional assumptions (not confirmed final wiring or ALSA device names):
 - Talk button: BCM GPIO17; camera button: BCM GPIO27.
 - Buttons are active-low with internal pull-ups and 50 ms debounce.
 - Picamera2 is installed via apt (`python3-picamera2`), not requirements.txt.
+- GPS: u-blox NEO-M8N on UART (/dev/serial0, 9600 baud) via NeoM8NLocation.
 """
 
 from __future__ import annotations
@@ -12,8 +13,10 @@ from __future__ import annotations
 import asyncio
 import io
 import logging
+import threading
 import time
-from typing import Optional
+from collections.abc import Callable
+from typing import Any, Optional
 
 from config import Settings
 from interfaces import (
@@ -34,6 +37,7 @@ from interfaces import (
     LocationFix,
     VideoFrame,
 )
+from location.nmea import parse_nmea_line
 
 logger = logging.getLogger(__name__)
 
@@ -41,6 +45,8 @@ logger = logging.getLogger(__name__)
 TALK_BUTTON_GPIO = 17
 CAMERA_BUTTON_GPIO = 27
 BUTTON_BOUNCE_TIME_S = 0.05
+GPS_STALE_AFTER_SECONDS = 15.0
+SerialFactory = Callable[[str, int], Any]
 
 
 class PiAudioInput:
@@ -347,29 +353,159 @@ class PiButton:
             self._device = None
 
 
-class UnavailableLocation:
-    """Placeholder until a GPS receiver is wired on the Pi."""
+def _open_serial_port(port: str, baud_rate: int) -> Any:
+    """Open a UART port for NMEA. Imported lazily so laptop tests need no pyserial."""
+    import serial
+
+    return serial.Serial(port=port, baudrate=baud_rate, timeout=1.0)
+
+
+class NeoM8NLocation:
+    """u-blox NEO-M8N UART GPS: background NMEA reader, latest valid fix."""
+
+    def __init__(
+        self,
+        port: str,
+        baud_rate: int,
+        *,
+        serial_factory: SerialFactory | None = None,
+        stale_after_seconds: float = GPS_STALE_AFTER_SECONDS,
+    ) -> None:
+        if not port:
+            raise ValueError("GPS serial port must not be empty.")
+        if baud_rate <= 0:
+            raise ValueError("GPS baud rate must be greater than zero.")
+        self._port = port
+        self._baud_rate = baud_rate
+        self._serial_factory = serial_factory or _open_serial_port
+        self._stale_after_seconds = stale_after_seconds
+        self._lock = threading.Lock()
+        self._fix: LocationFix | None = None
+        self._error: str | None = None
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._serial: Any = None
+        self._started = False
+
+    def start(self) -> None:
+        """Open the UART and begin reading NMEA in a background thread."""
+        if self._started:
+            return
+        self._stop.clear()
+        self._thread = threading.Thread(
+            target=self._read_loop,
+            name="neo-m8n-gps",
+            daemon=True,
+        )
+        self._thread.start()
+        self._started = True
+
+    def _read_loop(self) -> None:
+        try:
+            self._serial = self._serial_factory(self._port, self._baud_rate)
+        except Exception as error:
+            message = str(error).strip() or "GPS is disconnected."
+            with self._lock:
+                self._error = "GPS is disconnected."
+            logger.warning("GPS serial open failed on %s: %s", self._port, message)
+            return
+
+        with self._lock:
+            self._error = None
+
+        try:
+            while not self._stop.is_set():
+                try:
+                    raw = self._serial.readline()
+                except Exception as error:
+                    message = str(error).strip() or "GPS is disconnected."
+                    with self._lock:
+                        self._error = "GPS is disconnected."
+                    logger.warning("GPS serial read failed: %s", message)
+                    break
+                if not raw:
+                    continue
+                if isinstance(raw, bytes):
+                    line = raw.decode("ascii", errors="ignore")
+                else:
+                    line = str(raw)
+                fix = parse_nmea_line(line)
+                if fix is None:
+                    continue
+                with self._lock:
+                    self._fix = fix
+                    self._error = None
+        finally:
+            serial_port = self._serial
+            self._serial = None
+            if serial_port is not None:
+                try:
+                    serial_port.close()
+                except Exception:
+                    pass
 
     async def current_fix(self) -> LocationFix:
-        raise RuntimeError("GPS is not available on this device yet.")
+        """Return the latest valid fix, or raise a speakable GPS error."""
+        if not self._started:
+            self.start()
+        with self._lock:
+            fix = self._fix
+            error = self._error
+        if error and fix is None:
+            raise RuntimeError(error)
+        if fix is None:
+            raise RuntimeError("Waiting for a GPS fix.")
+        age = time.time() - fix.timestamp
+        if age > self._stale_after_seconds:
+            raise RuntimeError("Waiting for a GPS fix.")
+        return fix
+
+    def apply_nmea_for_tests(self, sentence: str, *, timestamp: float | None = None) -> None:
+        """Inject one NMEA sentence without opening a serial port (unit tests)."""
+        self._started = True
+        fix = parse_nmea_line(sentence, timestamp=timestamp)
+        if fix is None:
+            return
+        with self._lock:
+            self._fix = fix
+            self._error = None
 
     async def close(self) -> None:
-        return None
+        """Stop the reader thread and close the serial port."""
+        self._stop.set()
+        serial_port = self._serial
+        if serial_port is not None:
+            try:
+                serial_port.close()
+            except Exception:
+                pass
+        thread = self._thread
+        self._thread = None
+        if thread is not None and thread.is_alive():
+            await asyncio.to_thread(thread.join, 2.0)
+        self._started = False
+        with self._lock:
+            self._fix = None
+            self._error = None
 
 
 class PiPeripherals:
     """Bundled Pi peripherals; capture stays deferred until matching buttons."""
 
-    def __init__(self) -> None:
+    def __init__(self, settings: Settings) -> None:
         self.audio_input = create_audio_input()
         self.audio_output = create_audio_output()
         self.camera = create_camera()
-        self.location = create_location()
+        self.location = create_location(settings)
         self.talk_button = create_button(TALK_BUTTON_GPIO)
         self.camera_button = create_button(CAMERA_BUTTON_GPIO)
 
     async def start(self) -> None:
-        """Defer audio and camera capture until their buttons are held."""
+        """Start GPS reading; defer audio and camera until their buttons are held."""
+        location = self.location
+        start = getattr(location, "start", None)
+        if callable(start):
+            start()
 
     async def close(self) -> None:
         await self.audio_input.close()
@@ -380,9 +516,9 @@ class PiPeripherals:
         await self.camera_button.close()
 
 
-def create_peripherals(_settings: Settings) -> CompanionPeripherals:
+def create_peripherals(settings: Settings) -> CompanionPeripherals:
     """Build the Raspberry Pi peripheral bundle used for hardware mode."""
-    return PiPeripherals()
+    return PiPeripherals(settings)
 
 
 def create_audio_input() -> AudioInput:
@@ -405,6 +541,9 @@ def create_button(pin: int) -> Button:
     return PiButton(pin)
 
 
-def create_location() -> Location:
-    """Create a location driver that reports GPS as unavailable."""
-    return UnavailableLocation()
+def create_location(settings: Settings) -> Location:
+    """Create a NEO-M8N UART location driver from settings."""
+    return NeoM8NLocation(
+        port=settings.gps_serial_port,
+        baud_rate=settings.gps_baud_rate,
+    )

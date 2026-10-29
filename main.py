@@ -1,10 +1,9 @@
-
 """Application entry point for the handheld companion prototype."""
 
 import asyncio
 
 from config import DeploymentMode, Settings
-from gemini_service import run_gemini_live
+from gemini.service import run_gemini_live
 from interfaces import CompanionPeripherals
 
 
