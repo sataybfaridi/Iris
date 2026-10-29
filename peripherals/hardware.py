@@ -30,6 +30,8 @@ from interfaces import (
     ButtonEvent,
     Camera,
     CompanionPeripherals,
+    Location,
+    LocationFix,
     VideoFrame,
 )
 
@@ -345,6 +347,16 @@ class PiButton:
             self._device = None
 
 
+class UnavailableLocation:
+    """Placeholder until a GPS receiver is wired on the Pi."""
+
+    async def current_fix(self) -> LocationFix:
+        raise RuntimeError("GPS is not available on this device yet.")
+
+    async def close(self) -> None:
+        return None
+
+
 class PiPeripherals:
     """Bundled Pi peripherals; capture stays deferred until matching buttons."""
 
@@ -352,6 +364,7 @@ class PiPeripherals:
         self.audio_input = create_audio_input()
         self.audio_output = create_audio_output()
         self.camera = create_camera()
+        self.location = create_location()
         self.talk_button = create_button(TALK_BUTTON_GPIO)
         self.camera_button = create_button(CAMERA_BUTTON_GPIO)
 
@@ -362,6 +375,7 @@ class PiPeripherals:
         await self.audio_input.close()
         await self.audio_output.close()
         await self.camera.close()
+        await self.location.close()
         await self.talk_button.close()
         await self.camera_button.close()
 
@@ -389,3 +403,8 @@ def create_camera() -> Camera:
 def create_button(pin: int) -> Button:
     """Create a GPIO button driver exposing transitions as an async event stream."""
     return PiButton(pin)
+
+
+def create_location() -> Location:
+    """Create a location driver that reports GPS as unavailable."""
+    return UnavailableLocation()

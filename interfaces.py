@@ -70,6 +70,37 @@ class ButtonEvent:
             raise ValueError("timestamp must be non-negative.")
 
 
+def _validate_coordinate(name: str, value: float, low: float, high: float) -> None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise TypeError(f"{name} must be a number.")
+    if not low <= value <= high:
+        raise ValueError(f"{name} must be between {low:g} and {high:g}.")
+
+
+@dataclass(frozen=True)
+class LocationFix:
+    """A GPS fix: WGS84 degrees, accuracy in meters, and a Unix timestamp."""
+
+    latitude: float
+    longitude: float
+    accuracy_meters: float
+    timestamp: float
+
+    def __post_init__(self) -> None:
+        _validate_coordinate("latitude", self.latitude, -90, 90)
+        _validate_coordinate("longitude", self.longitude, -180, 180)
+        if isinstance(self.accuracy_meters, bool) or not isinstance(
+            self.accuracy_meters, (int, float)
+        ):
+            raise TypeError("accuracy_meters must be a number.")
+        if self.accuracy_meters < 0:
+            raise ValueError("accuracy_meters must be zero or greater.")
+        if isinstance(self.timestamp, bool) or not isinstance(self.timestamp, (int, float)):
+            raise TypeError("timestamp must be a number.")
+        if self.timestamp < 0:
+            raise ValueError("timestamp must be non-negative.")
+
+
 @runtime_checkable
 class AudioInput(Protocol):
     async def start_capture(self) -> None: ...
@@ -108,12 +139,18 @@ class Button(Protocol):
 
 
 @runtime_checkable
+class Location(Protocol):
+    async def current_fix(self) -> LocationFix: ...
+
+
+@runtime_checkable
 class CompanionPeripherals(Protocol):
     audio_input: AudioInput
     audio_output: AudioOutput
     camera: Camera
     talk_button: Button
     camera_button: Button
+    location: Location
 
     async def start(self) -> None: ...
 

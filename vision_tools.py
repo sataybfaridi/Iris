@@ -135,8 +135,10 @@ _FACES_USER_NOTE = (
 def build_system_instruction(camera_faces_user: bool) -> str:
     """Gemini's instructions. The laptop webcam faces you (directions flip);
     the Pi camera points away from you like a phone's back camera."""
+    from location_tools import LOCATION_INSTRUCTION
+
     note = _FACES_USER_NOTE if camera_faces_user else _FACES_AWAY_NOTE
-    return _BASE_INSTRUCTION.format(direction_note=note)
+    return _BASE_INSTRUCTION.format(direction_note=note) + LOCATION_INSTRUCTION
 
 
 # Default (Pi-style camera). gemini_service picks the right one.

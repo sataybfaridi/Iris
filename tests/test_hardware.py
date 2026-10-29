@@ -47,6 +47,8 @@ class HardwareDriverTests(unittest.IsolatedAsyncioTestCase):
             [device.pull_up for device in created_buttons],
             [True, True],
         )
+        with self.assertRaisesRegex(RuntimeError, "GPS is not available"):
+            await peripherals.location.current_fix()
         await peripherals.close()
 
     async def test_gpio_button_publishes_async_press_and_release_events(self) -> None:

@@ -11,8 +11,16 @@ microphone, speaker, and keyboard drivers in `peripherals/mock.py`.
 2. Copy `.env.example` to `.env` and set `GEMINI_API_KEY`.
 3. Keep `DEPLOYMENT_MODE=mock` for laptop development or set it to
    `hardware` for Raspberry Pi 5.
-4. Run `python main.py`. In mock mode, hold **Space** to talk and hold **C**
+4. For mock mode, also set `MOCK_LATITUDE`, `MOCK_LONGITUDE`,
+   `MOCK_LOCATION_ACCURACY_METERS`, and `GOOGLE_MAPS_API_KEY`. The Maps
+   key needs the Routes API and the Places API (New) enabled. Hardware
+   mode does not use these.
+5. Run `python main.py`. In mock mode, hold **Space** to talk and hold **C**
    to stream camera frames. Release either key to stop that input.
+   Ask "where am I?" to hear the mock coordinates. Ask for directions to
+   a place, or to the nearest gas station, to start turn-by-turn guidance.
+   Iris speaks the current step, then the next one as the simulated walk
+   reaches it.
 
 The mock mode sends 16 kHz mono PCM microphone audio and JPEG camera images to
 Gemini Live, and plays returned 24 kHz PCM audio through the laptop speaker.

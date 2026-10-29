@@ -23,6 +23,8 @@ from interfaces import (
     ButtonEvent,
     Camera,
     CompanionPeripherals,
+    Location,
+    LocationFix,
     VideoFrame,
 )
 
@@ -655,11 +657,39 @@ class LaptopButton:
             self._listener.stop()
             self._listener = None
 
+class LaptopLocation:
+    """Fixed GPS fix from the environment, used for laptop development."""
+
+    def __init__(
+        self, latitude: float, longitude: float, accuracy_meters: float
+    ) -> None:
+        if latitude is None or longitude is None or accuracy_meters is None:
+            raise ValueError("Mock location coordinates must be set.")
+        # Reject an out-of-range fix at startup, before a question is asked.
+        LocationFix(latitude, longitude, accuracy_meters, timestamp=0.0)
+        self._latitude = float(latitude)
+        self._longitude = float(longitude)
+        self._accuracy_meters = float(accuracy_meters)
+
+    async def current_fix(self) -> LocationFix:
+        """Return the configured coordinates with a fresh timestamp."""
+        return LocationFix(
+            latitude=self._latitude,
+            longitude=self._longitude,
+            accuracy_meters=self._accuracy_meters,
+            timestamp=time.time(),
+        )
+
+    async def close(self) -> None:
+        return None
+
+
 class LaptopPeripherals:
-    def __init__(self) -> None:
+    def __init__(self, settings: Settings) -> None:
         self.audio_input = create_audio_input()
         self.audio_output = create_audio_output()
         self.camera = create_camera()
+        self.location = create_location(settings)
 
         self.talk_button = create_button(
             keyboard.Key.space
@@ -676,12 +706,13 @@ class LaptopPeripherals:
         await self.audio_input.close()
         await self.audio_output.close()
         await self.camera.close()
+        await self.location.close()
         await self.talk_button.close()
         await self.camera_button.close()
 
-def create_peripherals(_settings: Settings) -> CompanionPeripherals:
+def create_peripherals(settings: Settings) -> CompanionPeripherals:
     """Build the laptop peripheral bundle used for mock development."""
-    return LaptopPeripherals()
+    return LaptopPeripherals(settings)
 
 
 def create_audio_input() -> AudioInput:
@@ -701,3 +732,12 @@ def create_camera() -> Camera:
 def create_button(key=keyboard.Key.space) -> Button:
     """Create a laptop keyboard button for development testing."""
     return LaptopButton(key)
+
+
+def create_location(settings: Settings) -> Location:
+    """Create a mock location that always returns the configured fix."""
+    return LaptopLocation(
+        latitude=settings.mock_latitude,
+        longitude=settings.mock_longitude,
+        accuracy_meters=settings.mock_location_accuracy_meters,
+    )

@@ -8,8 +8,16 @@ from collections.abc import Awaitable, Callable
 from typing import Any
 
 from config import DeploymentMode, Settings
+from location_tools import (
+    LOCATION_TOOL_NAMES,
+    build_location_tools,
+    handle_location_tool_call,
+)
+from navigation import NavigationController
 from vision_tools import (
+    FOCUS_TOOL,
     VisionState,
+    ZOOM_TOOL,
     build_camera_tools,
     build_system_instruction,
     handle_tool_call,
@@ -43,7 +51,7 @@ async def run_gemini_live(
             system_instruction=build_system_instruction(
                 camera_faces_user=settings.mode is DeploymentMode.MOCK
             ),
-            tools=[build_camera_tools(types)],
+            tools=[build_camera_tools(types), build_location_tools(types)],
             realtime_input_config=types.RealtimeInputConfig(
                 automatic_activity_detection=types.AutomaticActivityDetection(
                     disabled=True
@@ -53,17 +61,33 @@ async def run_gemini_live(
             output_audio_transcription=types.AudioTranscriptionConfig(),
         ),
     ) as session:
-        await stream_live_session(peripherals, session)
+        await stream_live_session(
+            peripherals, session, settings.google_maps_api_key
+        )
 
 
 async def stream_live_session(
-    peripherals: CompanionPeripherals, session: Any
+    peripherals: CompanionPeripherals,
+    session: Any,
+    maps_api_key: str = "",
 ) -> None:
     """Run response and control tasks until one ends or the session fails."""
     state = VisionState()
+    user_idle = asyncio.Event()
+    user_idle.set()
+    navigator = NavigationController(
+        lambda phrase: speak_navigation_cue(session, phrase),
+        idle=user_idle,
+    )
     tasks = (
-        asyncio.create_task(receive_live_responses(session, peripherals, state)),
-        asyncio.create_task(listen_for_button_events(peripherals, session, state)),
+        asyncio.create_task(
+            receive_live_responses(
+                session, peripherals, state, maps_api_key, navigator
+            )
+        ),
+        asyncio.create_task(
+            listen_for_button_events(peripherals, session, state, user_idle)
+        ),
     )
     try:
         done, _ = await asyncio.wait(
@@ -78,10 +102,21 @@ async def stream_live_session(
             f"{finished_names}."
         )
     finally:
+        navigator.cancel()
         for task in tasks:
             if not task.done():
                 task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
+
+
+async def speak_navigation_cue(session: Any, phrase: str) -> None:
+    """Ask Gemini to say one GPS sentence and nothing else."""
+    from google.genai import types
+
+    print(f"[Navigation] {phrase}", flush=True)
+    await session.send_realtime_input(activity_start=types.ActivityStart())
+    await session.send_realtime_input(text=f"[Navigation cue: {phrase}]")
+    await session.send_realtime_input(activity_end=types.ActivityEnd())
 
 
 async def send_audio_frames(
@@ -135,12 +170,16 @@ async def receive_live_responses(
     session: Any,
     peripherals: CompanionPeripherals,
     state: VisionState | None = None,
+    maps_api_key: str = "",
+    navigator: NavigationController | None = None,
 ) -> None:
     """Receive model events independently from speaker playback."""
     audio_queue: asyncio.Queue[AudioOutputFrame] = asyncio.Queue()
     tasks = (
         asyncio.create_task(
-            receive_live_events(session, peripherals, audio_queue, state),
+            receive_live_events(
+                session, peripherals, audio_queue, state, maps_api_key, navigator
+            ),
             name="gemini-live-receiver",
         ),
         asyncio.create_task(
@@ -172,6 +211,8 @@ async def receive_live_events(
     peripherals: CompanionPeripherals,
     audio_queue: asyncio.Queue[AudioOutputFrame],
     state: VisionState | None = None,
+    maps_api_key: str = "",
+    navigator: NavigationController | None = None,
 ) -> None:
     """Receive complete model turns continuously and enqueue their audio."""
     if state is None:
@@ -186,12 +227,19 @@ async def receive_live_events(
         async for response in session.receive():
             received_response = True
 
-            # Gemini asked to zoom/refocus. Run it in the background so we
-            # keep receiving (camera work can take a second or two).
+            # Gemini asked for a camera, location, or directions tool.
+            # Run it in the background so we keep receiving.
             tool_call = getattr(response, "tool_call", None)
             if tool_call is not None:
                 task = asyncio.create_task(
-                    handle_tool_call(tool_call, session, peripherals.camera, state)
+                    dispatch_tool_call(
+                        tool_call,
+                        session,
+                        peripherals,
+                        state,
+                        maps_api_key,
+                        navigator,
+                    )
                 )
                 tool_tasks.add(task)
                 task.add_done_callback(_finish_tool_task(tool_tasks))
@@ -210,11 +258,58 @@ async def receive_live_events(
             )
 
 
+class _ToolCalls:
+    def __init__(self, function_calls: list) -> None:
+        self.function_calls = function_calls
+
+
+def _split_tool_calls(tool_call: Any) -> tuple[_ToolCalls | None, _ToolCalls | None, _ToolCalls | None]:
+    camera_names = {ZOOM_TOOL, FOCUS_TOOL}
+    camera, location, unknown = [], [], []
+    for call in tool_call.function_calls or ():
+        name = getattr(call, "name", None)
+        if name in camera_names:
+            camera.append(call)
+        elif name in LOCATION_TOOL_NAMES:
+            location.append(call)
+        else:
+            unknown.append(call)
+    return (
+        _ToolCalls(camera) if camera else None,
+        _ToolCalls(location) if location else None,
+        _ToolCalls(unknown) if unknown else None,
+    )
+
+
+async def dispatch_tool_call(
+    tool_call: Any,
+    session: Any,
+    peripherals: CompanionPeripherals,
+    state: VisionState,
+    maps_api_key: str,
+    navigator: NavigationController | None = None,
+) -> None:
+    """Send camera calls to the camera handler and location calls to Maps."""
+    camera_call, location_call, unknown_call = _split_tool_calls(tool_call)
+    if camera_call is not None:
+        await handle_tool_call(camera_call, session, peripherals.camera, state)
+    if unknown_call is not None:
+        await handle_tool_call(unknown_call, session, peripherals.camera, state)
+    if location_call is not None:
+        await handle_location_tool_call(
+            location_call,
+            session,
+            peripherals.location,
+            maps_api_key,
+            navigator,
+        )
+
+
 def _finish_tool_task(tool_tasks: set):
     def done(task: asyncio.Task) -> None:
         tool_tasks.discard(task)
         if not task.cancelled() and task.exception() is not None:
-            print(f"[Vision] Camera tool failed: {task.exception()}", flush=True)
+            print(f"[Live] Tool call failed: {task.exception()}", flush=True)
 
     return done
 
@@ -317,6 +412,7 @@ async def listen_for_button_events(
     peripherals: CompanionPeripherals,
     session: Any,
     state: VisionState | None = None,
+    user_idle: asyncio.Event | None = None,
 ) -> None:
     """Hold Space to talk. Press C once to turn the camera on, again to turn it off."""
     from google.genai import types
@@ -369,6 +465,8 @@ async def listen_for_button_events(
 
     async def start_talking() -> None:
         nonlocal question_streamer, talk_started, told_camera_on
+        if user_idle is not None:
+            user_idle.clear()
         talk_started = time.monotonic()
         await session.send_realtime_input(activity_start=types.ActivityStart())
         # Tell Gemini right away whether it has a live picture.
@@ -406,6 +504,8 @@ async def listen_for_button_events(
                 audio=types.Blob(data=SILENCE_PCM, mime_type="audio/pcm;rate=16000")
             )
         await session.send_realtime_input(activity_end=types.ActivityEnd())
+        if user_idle is not None:
+            user_idle.set()
 
     tasks = (
         asyncio.create_task(

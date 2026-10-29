@@ -14,8 +14,10 @@ dotenv_stub.load_dotenv = lambda: None
 sys.modules.setdefault("dotenv", dotenv_stub)
 
 import config
+import directions
 import gemini_service
-from interfaces import AudioInputFrame, AudioOutputFrame
+import location_tools
+from interfaces import AudioInputFrame, AudioOutputFrame, LocationFix
 
 
 class FakeBlob:
@@ -408,21 +410,211 @@ class LiveServiceTests(unittest.IsolatedAsyncioTestCase):
             "DEPLOYMENT_MODE": "mock",
             "GEMINI_API_KEY": "test-key",
             "GEMINI_LIVE_MODEL": "test-live-model",
+            "MOCK_LATITUDE": "37.7",
+            "MOCK_LONGITUDE": "-122.4",
+            "MOCK_LOCATION_ACCURACY_METERS": "8",
+            "GOOGLE_MAPS_API_KEY": "maps-key",
         }
         with patch.dict(os.environ, environment, clear=True):
             settings = config.Settings.from_env()
 
         self.assertEqual(settings.gemini_live_model, "test-live-model")
+        self.assertEqual(settings.mock_latitude, 37.7)
+        self.assertEqual(settings.mock_longitude, -122.4)
+        self.assertEqual(settings.mock_location_accuracy_meters, 8)
+        self.assertEqual(settings.google_maps_api_key, "maps-key")
 
     def test_settings_default_to_live_api_model(self) -> None:
         environment = {
             "DEPLOYMENT_MODE": "mock",
             "GEMINI_API_KEY": "test-key",
+            "MOCK_LATITUDE": "37.7",
+            "MOCK_LONGITUDE": "-122.4",
+            "MOCK_LOCATION_ACCURACY_METERS": "8",
+            "GOOGLE_MAPS_API_KEY": "maps-key",
         }
         with patch.dict(os.environ, environment, clear=True):
             settings = config.Settings.from_env()
 
         self.assertEqual(settings.gemini_live_model, "gemini-3.8-live")
+
+    def test_mock_mode_requires_location_and_maps_settings(self) -> None:
+        environment = {
+            "DEPLOYMENT_MODE": "mock",
+            "GEMINI_API_KEY": "test-key",
+        }
+        with patch.dict(os.environ, environment, clear=True):
+            with self.assertRaises(ValueError):
+                config.Settings.from_env()
+
+    async def test_location_tool_response_matches_the_fix(self) -> None:
+        class FakeFunctionResponse:
+            def __init__(self, *, id, name, response) -> None:
+                self.id = id
+                self.name = name
+                self.response = response
+
+        class Session:
+            def __init__(self) -> None:
+                self.responses = []
+
+            async def send_tool_response(self, function_responses) -> None:
+                self.responses.extend(function_responses)
+
+        class Location:
+            async def current_fix(self):
+                return LocationFix(37.7, -122.4, 8, timestamp=1)
+
+        google_module = types.ModuleType("google")
+        google_module.__path__ = []
+        genai_module = types.ModuleType("google.genai")
+        genai_module.types = SimpleNamespace(FunctionResponse=FakeFunctionResponse)
+        session = Session()
+        tool_call = SimpleNamespace(
+            function_calls=[
+                SimpleNamespace(id="loc-1", name="get_current_location", args={})
+            ]
+        )
+
+        with patch.dict(
+            sys.modules,
+            {"google": google_module, "google.genai": genai_module},
+        ):
+            await location_tools.handle_location_tool_call(
+                tool_call, session, Location(), "maps-key"
+            )
+
+        self.assertEqual(len(session.responses), 1)
+        self.assertEqual(session.responses[0].name, "get_current_location")
+        self.assertEqual(
+            session.responses[0].response,
+            {
+                "status": "ok",
+                "latitude": 37.7,
+                "longitude": -122.4,
+                "accuracy_meters": 8,
+            },
+        )
+
+    async def test_directions_tool_response_speaks_parsed_steps(self) -> None:
+        class FakeFunctionResponse:
+            def __init__(self, *, id, name, response) -> None:
+                self.id = id
+                self.name = name
+                self.response = response
+
+        class Session:
+            def __init__(self) -> None:
+                self.responses = []
+
+            async def send_tool_response(self, function_responses) -> None:
+                self.responses.extend(function_responses)
+
+        class Location:
+            async def current_fix(self):
+                return LocationFix(37.7, -122.4, 8, timestamp=1)
+
+        google_module = types.ModuleType("google")
+        google_module.__path__ = []
+        genai_module = types.ModuleType("google.genai")
+        genai_module.types = SimpleNamespace(FunctionResponse=FakeFunctionResponse)
+        session = Session()
+        tool_call = SimpleNamespace(
+            function_calls=[
+                SimpleNamespace(
+                    id="dir-1",
+                    name="get_directions",
+                    args={"destination": "the pharmacy"},
+                )
+            ]
+        )
+        fixture = {
+            "routes": [
+                {
+                    "legs": [
+                        {
+                            "distanceMeters": 500,
+                            "duration": "360s",
+                            "steps": [
+                                {
+                                    "distanceMeters": 500,
+                                    "staticDuration": "360s",
+                                    "navigationInstruction": {
+                                        "instructions": "Head north"
+                                    },
+                                }
+                            ],
+                        }
+                    ]
+                }
+            ],
+        }
+
+        with (
+            patch.dict(
+                sys.modules,
+                {"google": google_module, "google.genai": genai_module},
+            ),
+            patch.object(directions, "_http_post_json", return_value=fixture),
+        ):
+            await location_tools.handle_location_tool_call(
+                tool_call, session, Location(), "maps-key"
+            )
+
+        response = session.responses[0].response
+        self.assertEqual(response["status"], "ok")
+        self.assertEqual(response["steps"][0]["instruction"], "Head north")
+        self.assertEqual(response["total_distance"], "500 m")
+
+    async def test_directions_tool_reports_unavailable_gps_without_maps(self) -> None:
+        class FakeFunctionResponse:
+            def __init__(self, *, id, name, response) -> None:
+                self.id = id
+                self.name = name
+                self.response = response
+
+        class Session:
+            def __init__(self) -> None:
+                self.responses = []
+
+            async def send_tool_response(self, function_responses) -> None:
+                self.responses.extend(function_responses)
+
+        class Location:
+            async def current_fix(self):
+                raise RuntimeError("GPS is not available on this device yet.")
+
+        google_module = types.ModuleType("google")
+        google_module.__path__ = []
+        genai_module = types.ModuleType("google.genai")
+        genai_module.types = SimpleNamespace(FunctionResponse=FakeFunctionResponse)
+        session = Session()
+        tool_call = SimpleNamespace(
+            function_calls=[
+                SimpleNamespace(
+                    id="dir-2",
+                    name="get_directions",
+                    args={"destination": "the pharmacy"},
+                )
+            ]
+        )
+
+        def fail_if_called(_url: str) -> dict:
+            raise AssertionError("Maps must not be called without a GPS fix.")
+
+        with (
+            patch.dict(
+                sys.modules,
+                {"google": google_module, "google.genai": genai_module},
+            ),
+            patch.object(directions, "_http_post_json", new=fail_if_called),
+        ):
+            await location_tools.handle_location_tool_call(
+                tool_call, session, Location(), "maps-key"
+            )
+
+        self.assertEqual(session.responses[0].response["status"], "error")
+        self.assertIn("GPS is not available", session.responses[0].response["message"])
 
 
 if __name__ == "__main__":
