@@ -208,7 +208,14 @@ async def handle_location_tool_call(
         ):
             say_now = navigator.start(steps)
             result = navigation_payload(result, say_now)
-        print(f"[Location] {call.name}: {result.get('status')}", flush=True)
+        status = result.get("status")
+        if status == "error":
+            print(
+                f"[Location] {call.name}: error — {result.get('message')}",
+                flush=True,
+            )
+        else:
+            print(f"[Location] {call.name}: {status}", flush=True)
         responses.append(
             types.FunctionResponse(id=call.id, name=call.name, response=result)
         )

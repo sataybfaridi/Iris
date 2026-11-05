@@ -326,12 +326,24 @@ def _capture_jpeg_from_picamera(camera) -> bytes:
     return _encode_rgb_array_as_jpeg(rgb)
 
 
+# Match mock camera tool contract (vision/tools.py expects zoom_to / retry_autofocus).
+DIGITAL_ZOOM_LEVELS = (1.0, 2.0, 3.0)
+MAX_AUTOFOCUS_RETRIES = 1
+MAX_ZOOM_RETRIES = 3
+GPS_FIX_WAIT_SECONDS = 2.5
+
+
 class PiCamera:
-    """CSI camera via Picamera2: JPEG frames for Live, same is_on/_fresh_frame contract as mock."""
+    """CSI camera via Picamera2 with Live + zoom/focus tool support."""
 
     def __init__(self) -> None:
         self._camera = None
         self._enabled = False
+        self._zoom = 1.0
+        self._zoom_center = (0.5, 0.5)
+        self._autofocus_retries = 0
+        self._zoom_retries = 0
+        self._full_res: tuple[int, int] | None = None
 
     @property
     def is_on(self) -> bool:
@@ -355,8 +367,22 @@ class PiCamera:
         )
         camera.configure(config)
         camera.start()
+        props = camera.camera_properties or {}
+        full = props.get("PixelArraySize") or props.get("ScalerCropMaximum")
+        if isinstance(full, (list, tuple)) and len(full) >= 2:
+            # ScalerCropMaximum can be (x, y, w, h); PixelArraySize is (w, h).
+            if len(full) >= 4:
+                self._full_res = (int(full[2]), int(full[3]))
+            else:
+                self._full_res = (int(full[0]), int(full[1]))
+        else:
+            self._full_res = (VIDEO_FRAME_WIDTH, VIDEO_FRAME_HEIGHT)
         self._camera = camera
         self._enabled = True
+        self._zoom = 1.0
+        self._zoom_center = (0.5, 0.5)
+        self._autofocus_retries = 0
+        self._zoom_retries = 0
 
     async def frames(self):
         """Yield JPEG frames while the camera is turned on (~1 FPS)."""
@@ -378,8 +404,159 @@ class PiCamera:
         return VideoFrame(jpeg=jpeg)
 
     async def new_question(self) -> None:
-        """Talk pressed: mock resets zoom here; Pi keeps a simple always-on view."""
-        return None
+        """Talk pressed: reset zoom and retry limits (same as laptop camera)."""
+        self._autofocus_retries = 0
+        self._zoom_retries = 0
+        if self._zoom != 1.0 or self._zoom_center != (0.5, 0.5):
+            self._zoom = 1.0
+            self._zoom_center = (0.5, 0.5)
+            await asyncio.to_thread(self._apply_scaler_crop, 1.0, 0.5, 0.5)
+
+    def _apply_scaler_crop(self, level: float, center_x: float, center_y: float) -> None:
+        """Digital zoom via Picamera2 ScalerCrop on the full sensor array."""
+        if self._camera is None:
+            return
+        full_w, full_h = self._full_res or (VIDEO_FRAME_WIDTH, VIDEO_FRAME_HEIGHT)
+        level = max(1.0, float(level))
+        crop_w = max(1, int(full_w / level))
+        crop_h = max(1, int(full_h / level))
+        x0 = int(center_x * full_w) - crop_w // 2
+        y0 = int(center_y * full_h) - crop_h // 2
+        x0 = max(0, min(x0, full_w - crop_w))
+        y0 = max(0, min(y0, full_h - crop_h))
+        self._camera.set_controls({"ScalerCrop": (x0, y0, crop_w, crop_h)})
+
+    def _is_same_view(self, level, center_x, center_y, tolerance=0.05) -> bool:
+        if level != self._zoom:
+            return False
+        if level == 1.0:
+            return True
+        old_x, old_y = self._zoom_center
+        return abs(center_x - old_x) <= tolerance and abs(center_y - old_y) <= tolerance
+
+    def _result(self, status: str, message: str, frame=None) -> dict:
+        zoom_left = max(0, MAX_ZOOM_RETRIES - self._zoom_retries)
+        focus_left = max(0, MAX_AUTOFOCUS_RETRIES - self._autofocus_retries)
+        return {
+            "status": status,
+            "message": message,
+            "zoom_level": self._zoom,
+            "max_zoom": DIGITAL_ZOOM_LEVELS[-1],
+            "zoom_retries_left": zoom_left,
+            "autofocus_retries_left": focus_left,
+            "last_try": zoom_left == 0,
+            "ask_user_to_move_closer": status == "limit_reached",
+            "frame": frame,
+        }
+
+    async def zoom_to(
+        self,
+        level: float,
+        center_x: float = 0.5,
+        center_y: float = 0.5,
+        count_as_retry: bool = True,
+    ) -> dict:
+        """Zoom around a point (0.0-1.0) via ScalerCrop, then send a fresh picture."""
+        if not self._enabled:
+            return self._result("camera_off", "The camera is off.")
+
+        try:
+            level = float(level)
+            center_x = float(center_x)
+            center_y = float(center_y)
+        except (TypeError, ValueError):
+            return self._result("bad_request", "Zoom values must be numbers.")
+
+        level = min(DIGITAL_ZOOM_LEVELS, key=lambda z: abs(z - level))
+        center_x = max(0.0, min(1.0, center_x))
+        center_y = max(0.0, min(1.0, center_y))
+
+        if count_as_retry and self._is_same_view(level, center_x, center_y):
+            return self._result(
+                "no_change",
+                f"Already at {level:.0f}x on that spot. Try a different spot, "
+                "or guide the user closer.",
+            )
+
+        if count_as_retry and self._zoom_retries >= MAX_ZOOM_RETRIES:
+            return self._result(
+                "limit_reached",
+                "Already zoomed as much as allowed for this question. "
+                "Ask the user to move closer to the object.",
+            )
+
+        try:
+            await asyncio.to_thread(self._apply_scaler_crop, level, center_x, center_y)
+        except Exception as error:
+            logger.warning("ScalerCrop zoom failed: %s", error)
+            return self._result(
+                "error",
+                "The camera could not zoom. Guide the user closer instead.",
+            )
+
+        self._zoom = level
+        self._zoom_center = (center_x, center_y)
+        if count_as_retry:
+            self._zoom_retries += 1
+
+        print(
+            f"[Camera] Zoom {level:.0f}x around ({center_x:.2f}, {center_y:.2f}).",
+            flush=True,
+        )
+
+        if not count_as_retry:
+            return self._result("ok", f"Zoom set to {level:.0f}x.")
+
+        # Let the crop apply for a frame before capturing.
+        await asyncio.sleep(0.15)
+        frame = await self._fresh_frame()
+        return self._result(
+            "ok", f"Zoomed to {level:.0f}x, here is a new picture.", frame
+        )
+
+    def _trigger_autofocus(self) -> bool:
+        """Trigger a continuous/auto AF cycle when the module supports it."""
+        if self._camera is None:
+            return False
+        try:
+            from libcamera import controls
+
+            self._camera.set_controls({"AfMode": controls.AfModeEnum.Auto})
+            cycle = getattr(self._camera, "autofocus_cycle", None)
+            if callable(cycle):
+                cycle()
+            else:
+                time.sleep(0.4)
+            return True
+        except Exception as error:
+            # IMX219 (Camera Module 2) is fixed-focus; AF controls are absent.
+            logger.info("Autofocus not available on this module: %s", error)
+            return False
+
+    async def retry_autofocus(self) -> dict:
+        if not self._enabled:
+            return self._result("camera_off", "The camera is off.")
+        if self._autofocus_retries >= MAX_AUTOFOCUS_RETRIES:
+            return self._result(
+                "limit_reached",
+                "Autofocus was already retried. If it's still blurry, "
+                "ask the user to hold the device steady or move closer.",
+            )
+        self._autofocus_retries += 1
+        focused = await asyncio.to_thread(self._trigger_autofocus)
+        await asyncio.sleep(0.2)
+        frame = await self._fresh_frame()
+        print("[Camera] Autofocus retry.", flush=True)
+        if focused:
+            return self._result(
+                "ok", "Refocused, here is a new picture.", frame
+            )
+        return self._result(
+            "focus_failed",
+            "This camera could not refocus (it may be fixed-focus). "
+            "Here is a new picture; guide the user closer if it's still unclear.",
+            frame,
+        )
 
     async def stop_capture(self) -> None:
         """Turn the Pi camera off."""
@@ -459,6 +636,7 @@ class NeoM8NLocation:
         *,
         serial_factory: SerialFactory | None = None,
         stale_after_seconds: float = GPS_STALE_AFTER_SECONDS,
+        fix_wait_seconds: float = GPS_FIX_WAIT_SECONDS,
     ) -> None:
         if not port:
             raise ValueError("GPS serial port must not be empty.")
@@ -468,6 +646,7 @@ class NeoM8NLocation:
         self._baud_rate = baud_rate
         self._serial_factory = serial_factory or _open_serial_port
         self._stale_after_seconds = stale_after_seconds
+        self._fix_wait_seconds = max(0.0, float(fix_wait_seconds))
         self._lock = threading.Lock()
         self._fix: LocationFix | None = None
         self._error: str | None = None
@@ -489,65 +668,81 @@ class NeoM8NLocation:
         self._thread.start()
         self._started = True
 
+    def _close_serial(self) -> None:
+        serial_port = self._serial
+        self._serial = None
+        if serial_port is not None:
+            try:
+                serial_port.close()
+            except Exception:
+                pass
+
     def _read_loop(self) -> None:
-        try:
-            self._serial = self._serial_factory(self._port, self._baud_rate)
-        except Exception as error:
-            message = str(error).strip() or "GPS is disconnected."
-            with self._lock:
-                self._error = "GPS is disconnected."
-            logger.warning("GPS serial open failed on %s: %s", self._port, message)
-            return
-
-        with self._lock:
-            self._error = None
-
-        try:
-            while not self._stop.is_set():
-                try:
-                    raw = self._serial.readline()
-                except Exception as error:
-                    message = str(error).strip() or "GPS is disconnected."
-                    with self._lock:
-                        self._error = "GPS is disconnected."
-                    logger.warning("GPS serial read failed: %s", message)
-                    break
-                if not raw:
-                    continue
-                if isinstance(raw, bytes):
-                    line = raw.decode("ascii", errors="ignore")
-                else:
-                    line = str(raw)
-                fix = parse_nmea_line(line)
-                if fix is None:
-                    continue
+        """Read NMEA until stopped; reconnect if the UART drops."""
+        while not self._stop.is_set():
+            try:
+                self._serial = self._serial_factory(self._port, self._baud_rate)
+            except Exception as error:
+                message = str(error).strip() or "GPS is disconnected."
                 with self._lock:
-                    self._fix = fix
-                    self._error = None
-        finally:
-            serial_port = self._serial
-            self._serial = None
-            if serial_port is not None:
-                try:
-                    serial_port.close()
-                except Exception:
-                    pass
+                    self._error = "GPS is disconnected."
+                logger.warning("GPS serial open failed on %s: %s", self._port, message)
+                self._stop.wait(2.0)
+                continue
+
+            with self._lock:
+                self._error = None
+            logger.info("GPS serial open on %s at %s baud", self._port, self._baud_rate)
+
+            try:
+                while not self._stop.is_set():
+                    try:
+                        raw = self._serial.readline()
+                    except Exception as error:
+                        message = str(error).strip() or "GPS is disconnected."
+                        with self._lock:
+                            self._error = "GPS is disconnected."
+                        logger.warning("GPS serial read failed: %s", message)
+                        break
+                    if not raw:
+                        continue
+                    if isinstance(raw, bytes):
+                        line = raw.decode("ascii", errors="ignore")
+                    else:
+                        line = str(raw)
+                    fix = parse_nmea_line(line)
+                    if fix is None:
+                        continue
+                    with self._lock:
+                        self._fix = fix
+                        self._error = None
+            finally:
+                self._close_serial()
+
+            if not self._stop.is_set():
+                self._stop.wait(1.0)
 
     async def current_fix(self) -> LocationFix:
         """Return the latest valid fix, or raise a speakable GPS error."""
         if not self._started:
             self.start()
-        with self._lock:
-            fix = self._fix
-            error = self._error
-        if error and fix is None:
-            raise RuntimeError(error)
-        if fix is None:
-            raise RuntimeError("Waiting for a GPS fix.")
-        age = time.time() - fix.timestamp
-        if age > self._stale_after_seconds:
-            raise RuntimeError("Waiting for a GPS fix.")
-        return fix
+
+        deadline = time.monotonic() + self._fix_wait_seconds
+        while True:
+            with self._lock:
+                fix = self._fix
+                error = self._error
+            if fix is not None:
+                age = time.time() - fix.timestamp
+                if age <= self._stale_after_seconds:
+                    return fix
+            if error and fix is None:
+                # Keep waiting a bit in case the reader reconnects mid-question.
+                if time.monotonic() >= deadline:
+                    raise RuntimeError(error)
+            elif time.monotonic() >= deadline:
+                raise RuntimeError("Waiting for a GPS fix.")
+            await asyncio.sleep(0.05 if self._fix_wait_seconds == 0 else 0.2)
 
     def apply_nmea_for_tests(self, sentence: str, *, timestamp: float | None = None) -> None:
         """Inject one NMEA sentence without opening a serial port (unit tests)."""

@@ -254,6 +254,8 @@ class HardwareDriverTests(unittest.IsolatedAsyncioTestCase):
                 self.closed = False
                 self.config = None
                 self.capture_file_calls = 0
+                self.controls = []
+                self.camera_properties = {"PixelArraySize": (3280, 2464)}
 
             def create_preview_configuration(self, main):
                 self.config = main
@@ -264,6 +266,9 @@ class HardwareDriverTests(unittest.IsolatedAsyncioTestCase):
 
             def start(self) -> None:
                 self.started = True
+
+            def set_controls(self, controls) -> None:
+                self.controls.append(controls)
 
             def capture_file(self, file_output, format=None) -> None:
                 self.capture_file_calls += 1
@@ -293,15 +298,22 @@ class HardwareDriverTests(unittest.IsolatedAsyncioTestCase):
             frames = camera.frames()
             frame = await asyncio.wait_for(anext(frames), timeout=2)
             fresh = await camera._fresh_frame()
+            zoom = await camera.zoom_to(2.0, 0.5, 0.5)
+            focus = await camera.retry_autofocus()
             await camera.stop_capture()
             self.assertFalse(camera.is_on)
             await frames.aclose()
             await camera.close()
 
-        self.assertEqual(fake.capture_file_calls, 2)
+        self.assertGreaterEqual(fake.capture_file_calls, 3)
         self.assertEqual(fake.assert_format, "jpeg")
         self.assertEqual(frame.jpeg, b"\xff\xd8picamera-jpeg\xff\xd9")
         self.assertEqual(fresh.jpeg, b"\xff\xd8picamera-jpeg\xff\xd9")
+        self.assertEqual(zoom["status"], "ok")
+        self.assertEqual(zoom["zoom_level"], 2.0)
+        self.assertIn("ScalerCrop", fake.controls[0])
+        self.assertEqual(focus["status"], "focus_failed")
+        self.assertIsNotNone(zoom.get("frame"))
 
     async def test_pi_camera_falls_back_to_pillow_when_capture_file_unavailable(
         self,
@@ -319,6 +331,7 @@ class HardwareDriverTests(unittest.IsolatedAsyncioTestCase):
             def __init__(self) -> None:
                 self.started = False
                 self.closed = False
+                self.camera_properties = {"PixelArraySize": (3280, 2464)}
 
             def create_preview_configuration(self, main):
                 return {"main": main}

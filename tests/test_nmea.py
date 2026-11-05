@@ -79,7 +79,7 @@ class NeoM8NLocationTests(unittest.IsolatedAsyncioTestCase):
         await location.close()
 
     async def test_void_sentences_do_not_create_a_fix(self) -> None:
-        location = NeoM8NLocation("/dev/null", 9600)
+        location = NeoM8NLocation("/dev/null", 9600, fix_wait_seconds=0)
         location.apply_nmea_for_tests(VOID_RMC, timestamp=time.time())
         with self.assertRaisesRegex(RuntimeError, "Waiting for a GPS fix"):
             await location.current_fix()
@@ -87,7 +87,7 @@ class NeoM8NLocationTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_stale_fix_raises_waiting(self) -> None:
         location = NeoM8NLocation(
-            "/dev/null", 9600, stale_after_seconds=1.0
+            "/dev/null", 9600, stale_after_seconds=1.0, fix_wait_seconds=0
         )
         location.apply_nmea_for_tests(VALID_GGA, timestamp=time.time() - 5)
         with self.assertRaisesRegex(RuntimeError, "Waiting for a GPS fix"):
@@ -98,7 +98,12 @@ class NeoM8NLocationTests(unittest.IsolatedAsyncioTestCase):
         def boom(_port: str, _baud: int):
             raise OSError("no such port")
 
-        location = NeoM8NLocation("/dev/does-not-exist", 9600, serial_factory=boom)
+        location = NeoM8NLocation(
+            "/dev/does-not-exist",
+            9600,
+            serial_factory=boom,
+            fix_wait_seconds=0,
+        )
         location.start()
         await asyncio.sleep(0.05)
         with self.assertRaisesRegex(RuntimeError, "GPS is disconnected"):
