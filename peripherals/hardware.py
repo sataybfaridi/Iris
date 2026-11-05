@@ -1,7 +1,9 @@
 """Raspberry Pi 5 peripheral drivers for hardware deployment mode.
 
 Provisional assumptions (not confirmed final wiring or ALSA device names):
-- Audio capture/playback use PortAudio/ALSA defaults (`device=None`).
+- Audio: Google Voice HAT (and similar) run at 48 kHz stereo. Capture is
+  mixed to mono and downsampled to 16 kHz for Gemini; playback is upsampled
+  from 24 kHz mono to 48 kHz stereo. PortAudio uses ALSA defaults (`device=None`).
 - Talk button: BCM GPIO17; camera button: BCM GPIO27.
 - Buttons are active-low with internal pull-ups and 50 ms debounce.
 - Picamera2 is installed via apt (`python3-picamera2`), not requirements.txt.
@@ -10,6 +12,7 @@ Provisional assumptions (not confirmed final wiring or ALSA device names):
 
 from __future__ import annotations
 
+import array
 import asyncio
 import io
 import logging
@@ -22,6 +25,7 @@ from config import Settings
 from interfaces import (
     AUDIO_INPUT_SAMPLE_RATE_HZ,
     AUDIO_OUTPUT_SAMPLE_RATE_HZ,
+    AUDIO_SAMPLE_WIDTH_BYTES,
     VIDEO_FRAME_HEIGHT,
     VIDEO_FRAME_WIDTH,
     VIDEO_FRAMES_PER_SECOND,
@@ -46,19 +50,84 @@ TALK_BUTTON_GPIO = 17
 CAMERA_BUTTON_GPIO = 27
 BUTTON_BOUNCE_TIME_S = 0.05
 GPS_STALE_AFTER_SECONDS = 15.0
+# Google Voice HAT / similar I2S cards: native rate and channel count.
+DEVICE_SAMPLE_RATE_HZ = 48_000
+DEVICE_CHANNELS = 2
+_INPUT_DOWNSAMPLE = DEVICE_SAMPLE_RATE_HZ // AUDIO_INPUT_SAMPLE_RATE_HZ  # 3
+_OUTPUT_UPSAMPLE = DEVICE_SAMPLE_RATE_HZ // AUDIO_OUTPUT_SAMPLE_RATE_HZ  # 2
 SerialFactory = Callable[[str, int], Any]
 
 
+def _stereo_i16_to_mono(pcm: bytes) -> bytes:
+    """Average L/R int16 samples into mono int16 PCM."""
+    if len(pcm) < 4:
+        return b""
+    samples = array.array("h")
+    samples.frombytes(pcm[: len(pcm) - (len(pcm) % 4)])
+    mono = array.array("h")
+    for index in range(0, len(samples) - 1, 2):
+        mono.append((samples[index] + samples[index + 1]) // 2)
+    return mono.tobytes()
+
+
+def _downsample_i16_mono(pcm: bytes, factor: int, pending: bytearray) -> bytes:
+    """Keep every Nth mono int16 sample; retain incomplete groups in pending."""
+    if factor <= 1:
+        return pcm
+    pending.extend(pcm)
+    usable_bytes = len(pending) - (len(pending) % AUDIO_SAMPLE_WIDTH_BYTES)
+    if usable_bytes <= 0:
+        return b""
+    samples = array.array("h")
+    samples.frombytes(bytes(pending[:usable_bytes]))
+    del pending[:usable_bytes]
+    complete = len(samples) - (len(samples) % factor)
+    if complete <= 0:
+        pending.extend(samples.tobytes())
+        return b""
+    down = array.array("h", samples[:complete:factor])
+    if complete < len(samples):
+        pending.extend(samples[complete:].tobytes())
+    return down.tobytes()
+
+
+def _upsample_i16_mono(pcm: bytes, factor: int) -> bytes:
+    """Repeat each mono int16 sample `factor` times."""
+    if factor <= 1 or not pcm:
+        return pcm
+    samples = array.array("h")
+    samples.frombytes(pcm[: len(pcm) - (len(pcm) % AUDIO_SAMPLE_WIDTH_BYTES)])
+    up = array.array("h")
+    for sample in samples:
+        for _ in range(factor):
+            up.append(sample)
+    return up.tobytes()
+
+
+def _mono_i16_to_stereo(pcm: bytes) -> bytes:
+    """Duplicate each mono int16 sample into L and R."""
+    if not pcm:
+        return b""
+    samples = array.array("h")
+    samples.frombytes(pcm[: len(pcm) - (len(pcm) % AUDIO_SAMPLE_WIDTH_BYTES)])
+    stereo = array.array("h")
+    for sample in samples:
+        stereo.append(sample)
+        stereo.append(sample)
+    return stereo.tobytes()
+
+
 class PiAudioInput:
-    """Wired microphone / ALSA-default capture producing 16 kHz mono PCM."""
+    """Voice HAT capture at 48 kHz stereo, delivered as 16 kHz mono PCM."""
 
     def __init__(self) -> None:
         self._queue: asyncio.Queue[Optional[bytes]] = asyncio.Queue()
         self._stream = None
         self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self._pending = bytearray()
 
     async def start_capture(self) -> None:
-        """Start capturing audio from the ALSA-default input device."""
+        """Start capturing from the ALSA-default Voice HAT input device."""
         import sounddevice as sd
 
         if self._stream is not None and self._stream.active:
@@ -66,16 +135,17 @@ class PiAudioInput:
 
         while not self._queue.empty():
             self._queue.get_nowait()
+        self._pending.clear()
 
         self._loop = asyncio.get_running_loop()
 
         if self._stream is None:
-            # device=None: provisional ALSA/PortAudio default capture.
+            # Native Voice HAT rate; resample to AUDIO_INPUT_SAMPLE_RATE_HZ in callback.
             self._stream = sd.RawInputStream(
-                samplerate=AUDIO_INPUT_SAMPLE_RATE_HZ,
-                channels=1,
+                samplerate=DEVICE_SAMPLE_RATE_HZ,
+                channels=DEVICE_CHANNELS,
                 dtype="int16",
-                blocksize=1600,
+                blocksize=DEVICE_SAMPLE_RATE_HZ // 10,  # ~100 ms
                 device=None,
                 callback=self._audio_callback,
             )
@@ -83,11 +153,11 @@ class PiAudioInput:
         self._stream.start()
 
     def _audio_callback(self, indata, frames, time_info, status) -> None:
-        if self._loop is not None:
-            self._loop.call_soon_threadsafe(
-                self._queue.put_nowait,
-                bytes(indata),
-            )
+        mono = _stereo_i16_to_mono(bytes(indata))
+        pcm16 = _downsample_i16_mono(mono, _INPUT_DOWNSAMPLE, self._pending)
+        if not pcm16 or self._loop is None:
+            return
+        self._loop.call_soon_threadsafe(self._queue.put_nowait, pcm16)
 
     async def frames(self):
         """Yield one capture's queued microphone frames until the stop sentinel."""
@@ -112,10 +182,11 @@ class PiAudioInput:
                 self._stream.stop()
             self._stream.close()
             self._stream = None
+        self._pending.clear()
 
 
 class PiAudioOutput:
-    """MAX98357A / ALSA-default speaker accepting 24 kHz mono PCM."""
+    """Voice HAT playback: accepts 24 kHz mono, plays as 48 kHz stereo."""
 
     def __init__(self) -> None:
         self._stream = None
@@ -123,19 +194,21 @@ class PiAudioOutput:
         self._generation = 0
 
     async def play(self, frame: AudioOutputFrame) -> None:
-        """Play one audio frame through the ALSA-default output device."""
+        """Play one Gemini audio frame through the ALSA-default output device."""
         import sounddevice as sd
 
         generation = self._generation
+        device_pcm = _mono_i16_to_stereo(
+            _upsample_i16_mono(frame.pcm, _OUTPUT_UPSAMPLE)
+        )
         async with self._lock:
             if generation != self._generation:
                 return
 
             if self._stream is None:
-                # device=None: provisional ALSA/PortAudio default playback.
                 self._stream = sd.RawOutputStream(
-                    samplerate=AUDIO_OUTPUT_SAMPLE_RATE_HZ,
-                    channels=1,
+                    samplerate=DEVICE_SAMPLE_RATE_HZ,
+                    channels=DEVICE_CHANNELS,
                     dtype="int16",
                     device=None,
                 )
@@ -143,7 +216,7 @@ class PiAudioOutput:
 
             stream = self._stream
             try:
-                await asyncio.to_thread(stream.write, frame.pcm)
+                await asyncio.to_thread(stream.write, device_pcm)
             except sd.PortAudioError:
                 if generation != self._generation:
                     return

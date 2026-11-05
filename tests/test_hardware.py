@@ -95,18 +95,23 @@ class HardwareDriverTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(released, ButtonEvent(pressed=False, timestamp=released.timestamp))
         self.assertGreaterEqual(released.timestamp, pressed.timestamp)
 
-    async def test_pi_audio_input_preserves_queued_pcm_when_stopped(self) -> None:
+    async def test_pi_audio_input_opens_at_device_rate_and_downsamples(self) -> None:
+        import array
+
         class FakeInputStream:
             active = False
 
             def __init__(self, **kwargs):
+                self.kwargs = kwargs
                 self.callback = kwargs["callback"]
 
             def start(self) -> None:
                 self.active = True
 
             def stop(self) -> None:
-                self.callback(b"\x01\x02", 1, None, None)
+                # Three stereo frames at 48 kHz → one 16 kHz mono sample after /3.
+                samples = array.array("h", [100, 100, 100, 100, 100, 100])
+                self.callback(samples.tobytes(), 3, None, None)
                 self.active = False
 
             def close(self) -> None:
@@ -118,13 +123,18 @@ class HardwareDriverTests(unittest.IsolatedAsyncioTestCase):
         with patch.dict(sys.modules, {"sounddevice": sounddevice}):
             audio_input = hardware.PiAudioInput()
             await audio_input.start_capture()
+            stream = audio_input._stream
             await audio_input.stop_capture()
             frames = [frame async for frame in audio_input.frames()]
             await audio_input.close()
 
-        self.assertEqual(frames, [AudioInputFrame(pcm=b"\x01\x02")])
+        self.assertEqual(stream.kwargs["samplerate"], hardware.DEVICE_SAMPLE_RATE_HZ)
+        self.assertEqual(stream.kwargs["channels"], hardware.DEVICE_CHANNELS)
+        self.assertEqual(frames, [AudioInputFrame(pcm=array.array("h", [100]).tobytes())])
 
-    async def test_pi_audio_output_uses_24khz_and_interrupts_stream(self) -> None:
+    async def test_pi_audio_output_upsamples_to_device_rate_and_interrupts(self) -> None:
+        import array
+
         streams = []
 
         class FakeOutputStream:
@@ -156,15 +166,40 @@ class HardwareDriverTests(unittest.IsolatedAsyncioTestCase):
 
         with patch.dict(sys.modules, {"sounddevice": sounddevice}):
             audio_output = hardware.PiAudioOutput()
-            await audio_output.play(AudioOutputFrame(pcm=b"\x03\x04"))
+            # One 24 kHz mono sample → two 48 kHz mono → stereo L/R pair twice.
+            await audio_output.play(AudioOutputFrame(pcm=array.array("h", [7]).tobytes()))
             await audio_output.interrupt()
 
-        self.assertEqual(streams[0].kwargs["samplerate"], 24_000)
-        self.assertEqual(streams[0].kwargs["channels"], 1)
+        self.assertEqual(streams[0].kwargs["samplerate"], hardware.DEVICE_SAMPLE_RATE_HZ)
+        self.assertEqual(streams[0].kwargs["channels"], hardware.DEVICE_CHANNELS)
         self.assertEqual(streams[0].kwargs["device"], None)
-        self.assertEqual(streams[0].frames, [b"\x03\x04"])
+        self.assertEqual(
+            streams[0].frames,
+            [array.array("h", [7, 7, 7, 7]).tobytes()],
+        )
         self.assertTrue(streams[0].stopped)
         self.assertTrue(streams[0].closed)
+
+    def test_audio_resample_helpers(self) -> None:
+        import array
+
+        stereo = array.array("h", [10, 30, 20, 40]).tobytes()
+        self.assertEqual(
+            hardware._stereo_i16_to_mono(stereo),
+            array.array("h", [20, 30]).tobytes(),
+        )
+        pending = bytearray()
+        down = hardware._downsample_i16_mono(
+            array.array("h", [1, 2, 3, 4, 5]).tobytes(), 3, pending
+        )
+        self.assertEqual(down, array.array("h", [1]).tobytes())
+        self.assertEqual(bytes(pending), array.array("h", [4, 5]).tobytes())
+        up = hardware._upsample_i16_mono(array.array("h", [9]).tobytes(), 2)
+        self.assertEqual(up, array.array("h", [9, 9]).tobytes())
+        self.assertEqual(
+            hardware._mono_i16_to_stereo(array.array("h", [5]).tobytes()),
+            array.array("h", [5, 5]).tobytes(),
+        )
 
     async def test_hardware_module_import_does_not_require_opencv(self) -> None:
         """Importing/creating peripherals must not load OpenCV (Pi BLAS issue)."""
