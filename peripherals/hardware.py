@@ -327,11 +327,16 @@ def _capture_jpeg_from_picamera(camera) -> bytes:
 
 
 class PiCamera:
-    """CSI Camera Module 3 Wide via Picamera2, producing 640x480 JPEGs at ~1 FPS."""
+    """CSI camera via Picamera2: JPEG frames for Live, same is_on/_fresh_frame contract as mock."""
 
     def __init__(self) -> None:
         self._camera = None
         self._enabled = False
+
+    @property
+    def is_on(self) -> bool:
+        """True while capture is running. Live uses this for camera notes and pictures."""
+        return self._enabled
 
     async def start_capture(self) -> None:
         """Turn the Pi camera on (lazy Picamera2 import; no OpenCV)."""
@@ -364,6 +369,17 @@ class PiCamera:
 
             yield VideoFrame(jpeg=jpeg)
             await asyncio.sleep(interval)
+
+    async def _fresh_frame(self) -> VideoFrame | None:
+        """One JPEG for the current question (Live send_picture / vision tools)."""
+        if not self._enabled or self._camera is None:
+            return None
+        jpeg = await asyncio.to_thread(_capture_jpeg_from_picamera, self._camera)
+        return VideoFrame(jpeg=jpeg)
+
+    async def new_question(self) -> None:
+        """Talk pressed: mock resets zoom here; Pi keeps a simple always-on view."""
+        return None
 
     async def stop_capture(self) -> None:
         """Turn the Pi camera off."""

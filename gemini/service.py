@@ -441,9 +441,13 @@ async def listen_for_button_events(
 
     async def send_picture(label: str | None = None) -> bool:
         """Send one fresh camera picture to Gemini (if the camera is on)."""
-        if not getattr(peripherals.camera, "is_on", False):
+        camera = peripherals.camera
+        camera_on = bool(
+            getattr(camera, "is_on", getattr(camera, "_enabled", False))
+        )
+        if not camera_on:
             return False
-        fresh = getattr(peripherals.camera, "_fresh_frame", None)
+        fresh = getattr(camera, "_fresh_frame", None)
         if fresh is None:
             return False
         frame = await fresh()
@@ -477,7 +481,10 @@ async def listen_for_button_events(
         talk_started = time.monotonic()
         await session.send_realtime_input(activity_start=types.ActivityStart())
         # Tell Gemini right away whether it has a live picture.
-        told_camera_on = bool(getattr(peripherals.camera, "is_on", False))
+        camera = peripherals.camera
+        told_camera_on = bool(
+            getattr(camera, "is_on", getattr(camera, "_enabled", False))
+        )
         await session.send_realtime_input(
             text=CAMERA_ON_NOTE if told_camera_on else CAMERA_OFF_NOTE
         )

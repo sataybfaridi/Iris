@@ -286,17 +286,22 @@ class HardwareDriverTests(unittest.IsolatedAsyncioTestCase):
 
         with patch.dict(sys.modules, {"picamera2": picamera2, "cv2": None}):
             camera = hardware.PiCamera()
+            self.assertFalse(camera.is_on)
             await camera.start_capture()
+            self.assertTrue(camera.is_on)
             fake = camera._camera
             frames = camera.frames()
             frame = await asyncio.wait_for(anext(frames), timeout=2)
+            fresh = await camera._fresh_frame()
             await camera.stop_capture()
+            self.assertFalse(camera.is_on)
             await frames.aclose()
             await camera.close()
 
-        self.assertEqual(fake.capture_file_calls, 1)
+        self.assertEqual(fake.capture_file_calls, 2)
         self.assertEqual(fake.assert_format, "jpeg")
         self.assertEqual(frame.jpeg, b"\xff\xd8picamera-jpeg\xff\xd9")
+        self.assertEqual(fresh.jpeg, b"\xff\xd8picamera-jpeg\xff\xd9")
 
     async def test_pi_camera_falls_back_to_pillow_when_capture_file_unavailable(
         self,
