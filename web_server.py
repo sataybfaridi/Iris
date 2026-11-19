@@ -23,6 +23,7 @@ import hashlib
 import secrets
 import socket
 import logging
+import time
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -283,6 +284,22 @@ PAGE = r"""<!doctype html>
   .tile .k{font-size:11.5px;color:var(--muted);text-transform:uppercase;letter-spacing:.08em;font-weight:600}
   .tile .v{font-family:var(--display);font-size:26px;font-weight:600;margin-top:6px}
   .dot{display:inline-block;width:9px;height:9px;border-radius:50%;margin-right:7px;vertical-align:middle}
+  .tile{container-type:inline-size}
+  .tile .v{font-size:clamp(16px,15cqi,26px)}   /* shrink on narrow tiles so "Last known" stays on one line */
+  .tile .s{font-size:12.5px;color:var(--muted);margin-top:6px;min-height:19px}
+  .tile .s b{color:var(--fg);font-weight:600}
+  .stale{opacity:.55}                 /* last-known values while the device is offline */
+  .meter{height:6px;border-radius:3px;margin-top:10px;overflow:hidden;background:rgba(31,193,182,.2)}
+  .meter span{display:block;height:100%;width:0;border-radius:3px;background:var(--ok);transition:width .4s}
+  .meter.low{background:rgba(232,193,90,.2)}.meter.low span{background:var(--warn)}
+  .meter.critical{background:rgba(255,122,102,.2)}.meter.critical span{background:var(--crit)}
+  .cards2{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:16px;margin-top:16px}
+  .cards2 .block{margin-top:0}
+  .kv{display:grid;grid-template-columns:auto 1fr;gap:10px 18px;margin:0;font-size:14px}
+  .kv dt{color:var(--muted)}.kv dd{margin:0;text-align:right}
+  .coords{font-family:var(--display);font-size:21px;font-weight:600;margin:0 0 12px;overflow-wrap:anywhere}
+  .note{color:var(--muted);font-size:13.5px}
+  a.icon-btn{display:inline-block;text-decoration:none;margin-top:14px}
   .list{display:flex;flex-direction:column;gap:10px}
   .contact{display:flex;align-items:center;gap:13px;background:var(--surface);border:1px solid var(--line);border-radius:12px;padding:13px 15px}
   .contact .avatar{width:38px;height:38px;border-radius:50%;background:var(--surface2);color:var(--accent);display:flex;align-items:center;justify-content:center;font-family:var(--display);font-weight:700;flex-shrink:0}
@@ -334,13 +351,42 @@ PAGE = r"""<!doctype html>
   </nav>
  
   <div class="panel" id="tab-overview">
-    <div class="h-row"><div><h2>Overview</h2><div class="sub">Device status (demo values).</div></div></div>
+    <div class="h-row"><div><h2>Overview</h2><div class="sub">Live from the device &middot; refreshes every 2 seconds.</div></div></div>
     <div class="tiles">
-      <div class="tile"><div class="k">Device</div><div class="v" id="tDevice"><span class="dot" style="background:var(--faint)"></span>&hellip;</div></div>
-      <div class="tile"><div class="k">Battery</div><div class="v mono" id="tBattery">&mdash;</div></div>
+      <div class="tile"><div class="k">Device</div><div class="v" id="tDevice"><span class="dot" style="background:var(--faint)"></span>&hellip;</div>
+        <div class="s" id="tDeviceSub"></div></div>
+      <div class="tile"><div class="k">Battery</div><div class="v" id="tBattery">&mdash;</div>
+        <div class="meter" id="tBatteryMeter" role="meter" aria-label="Battery charge" aria-valuemin="0" aria-valuemax="100" hidden><span></span></div>
+        <div class="s" id="tBatterySub"></div></div>
+      <div class="tile"><div class="k">Location</div><div class="v" id="tLocation">&mdash;</div>
+        <div class="s" id="tLocationSub"></div></div>
       <div class="tile"><div class="k">Camera</div><div class="v" id="tCamera"><span class="dot" style="background:var(--faint)"></span>&hellip;</div></div>
       <div class="tile"><div class="k">Recording</div><div class="v" id="tRecording"><span class="dot" style="background:var(--faint)"></span>&hellip;</div></div>
-      <div class="tile"><div class="k">Location <span style="color:var(--warn);font-size:9px">MOCK</span></div><div class="v" style="font-size:16px">Morton Grove, IL</div></div>
+    </div>
+    <div class="cards2">
+      <div class="block"><h3>Location</h3>
+        <div class="note" id="locNote">&hellip;</div>
+        <div id="locFix" hidden>
+          <div class="coords" id="locCoords"></div>
+          <dl class="kv">
+            <dt>Status</dt><dd id="locState"></dd>
+            <dt>Accuracy</dt><dd id="locAcc"></dd>
+            <dt>Updated</dt><dd id="locAge"></dd>
+          </dl>
+          <a class="icon-btn" id="locMap" href="#" target="_blank" rel="noopener noreferrer">Open in Google Maps &#8599;</a>
+        </div>
+      </div>
+      <div class="block"><h3>Device health</h3>
+        <dl class="kv" id="healthList">
+          <dt>Temperature</dt><dd id="hTemp">&mdash;</dd>
+          <dt>Power supply</dt><dd id="hPower">&mdash;</dd>
+          <dt>Battery</dt><dd id="hBatt">&mdash;</dd>
+          <dt>Processor load</dt><dd id="hLoad">&mdash;</dd>
+          <dt>Memory used</dt><dd id="hMem">&mdash;</dd>
+          <dt>Powered on for</dt><dd id="hUp">&mdash;</dd>
+          <dt>Last update</dt><dd id="hSeen">&mdash;</dd>
+        </dl>
+      </div>
     </div>
     <div class="block"><h3>How this connects to the device</h3>
       <div class="sub">Contacts you add on the next tab are saved straight to the device's
@@ -575,12 +621,115 @@ PAGE = r"""<!doctype html>
   // ---- live device status (Overview tiles + edit lock) ----
   var statusTimer=null;
   function dot(color){ return '<span class="dot" style="background:'+color+'"></span>'; }
-  function applyStatus(s){
-    var fresh = s && s.updated && (Date.now()/1000 - s.updated < 8);
-    $("#tDevice").innerHTML = fresh ? dot("var(--ok)")+"Online" : dot("var(--faint)")+"Offline";
-    $("#tBattery").textContent = (s && typeof s.battery==="number") ? (s.battery+"%") : "—";
-    $("#tCamera").innerHTML = (s && s.camera_on) ? dot("var(--ok)")+"On" : dot("var(--faint)")+"Off";
-    $("#tRecording").innerHTML = (s && s.recording) ? dot("var(--crit)")+"Recording" : dot("var(--faint)")+"Idle";
+  var LEVEL_COLOR={ok:"var(--ok)",low:"var(--warn)",critical:"var(--crit)",
+                   normal:"var(--ok)",warm:"var(--warn)",hot:"var(--crit)"};
+  var TEMP_WORD={normal:"Normal",warm:"Warm",hot:"Hot"};
+  var lastGood=null, lastSeen=null, skew=0;   // last status with data, when (device clock), clock offset
+  function num(x){ return (typeof x==="number" && isFinite(x)) ? x : null; }
+  // Only touch the page when something changed (keeps text selectable while it refreshes).
+  function put(el,html){ if(el._h!==html){ el._h=html; el.innerHTML=html; } }
+  function txt(el,s){ put(el, esc(s)); }
+  function fmtDur(min){
+    min=Math.max(0,Math.round(min));
+    if(min<1) return "under a minute";
+    if(min<60) return min+" min";
+    var h=Math.floor(min/60), m=min%60;
+    if(h>=48) return Math.round(h/24)+" days";
+    return h+" h"+(m?" "+m+" min":"");
+  }
+  function fmtAgo(sec){
+    sec=Math.max(0,Math.round(sec));
+    if(sec<5) return "just now";
+    if(sec<60) return sec+" s ago";
+    return fmtDur(sec/60)+" ago";
+  }
+  function clock(t){ return new Date(t*1000).toLocaleTimeString([],{hour:"numeric",minute:"2-digit"}); }
+
+  function renderBattery(s, fresh){
+    var b=s.battery_detail;
+    if(!b && num(s.battery)!==null)            // older status files only had a number
+      b={percent:s.battery, level:s.battery<=10?"critical":(s.battery<=20?"low":"ok"), state:"unknown"};
+    var meter=$("#tBatteryMeter");
+    if(!b || num(b.percent)===null){
+      txt($("#tBattery"),"—"); meter.hidden=true; $("#tBattery").classList.remove("stale");
+      txt($("#tBatterySub"), lastGood ? "No battery reading" : "");
+      return b;
+    }
+    txt($("#tBattery"), b.percent+"%");
+    $("#tBattery").classList.toggle("stale",!fresh);
+    meter.hidden=false;
+    meter.className="meter"+(b.level==="low"||b.level==="critical" ? " "+b.level : "");
+    meter.firstElementChild.style.width=Math.max(0,Math.min(100,b.percent))+"%";
+    meter.setAttribute("aria-valuenow",b.percent);
+    if(!fresh){ txt($("#tBatterySub"),"Last known"); return b; }
+    var left=num(b.minutes_left), full=num(b.minutes_to_full), tail="";
+    if(b.state==="charging") tail="charging"+(full!==null?" · full in "+fmtDur(full):"");
+    else if(b.state==="full") tail="fully charged";
+    else if(b.state==="discharging") tail=(left!==null?"about "+fmtDur(left)+" left":"on battery");
+    var lead=b.level==="critical" ? "Battery critical" : (b.level==="low" ? "Low battery" : "");
+    put($("#tBatterySub"), lead ? "<b>"+lead+"</b>"+(tail?" &middot; "+esc(tail):"")
+                                : esc(tail.charAt(0).toUpperCase()+tail.slice(1)));
+    return b;
+  }
+
+  function renderLocation(L, fresh, now){
+    var lat=L?num(L.latitude):null, lng=L?num(L.longitude):null, at=L?num(L.fix_time):null;
+    var hasFix=!!L && (L.state==="live"||L.state==="last_known") && lat!==null && lng!==null;
+    $("#locFix").hidden=!hasFix; $("#locNote").hidden=hasFix;
+    if(!hasFix){
+      var searching=!!L && L.state==="searching";
+      put($("#tLocation"), searching ? dot("var(--faint)")+"Searching" : "&mdash;");
+      txt($("#tLocationSub"), searching ? "Looking for satellites" : (L ? "GPS not connected" : ""));
+      txt($("#locNote"), searching
+        ? "Looking for GPS satellites. GPS needs a view of the sky, so indoors it can take a few minutes or not work at all."
+        : (L ? "This device doesn't have a GPS connected yet." : "No location yet."));
+      return;
+    }
+    var live=L.state==="live" && fresh, ago=at!==null ? fmtAgo(now-at) : "", acc=num(L.accuracy_m);
+    put($("#tLocation"), dot(live?"var(--ok)":"var(--warn)")+(live?"Live":"Last known"));
+    txt($("#tLocationSub"), "Updated "+ago+(acc!==null?" · ±"+Math.round(acc)+" m":""));
+    var coords=lat.toFixed(5)+", "+lng.toFixed(5);
+    txt($("#locCoords"), coords);
+    $("#locMap").href="https://www.google.com/maps/search/?api=1&query="+encodeURIComponent(lat+","+lng);
+    put($("#locState"), live ? dot("var(--ok)")+"Live GPS fix"
+      : dot("var(--warn)")+(fresh ? "Last known &middot; GPS signal lost" : "Last known &middot; device offline"));
+    txt($("#locAcc"), acc!==null ? "± "+Math.round(acc)+" m" : "—");
+    txt($("#locAge"), at!==null ? ago+" · "+clock(at) : "—");
+  }
+
+  function renderHealth(d, b, fresh, now){
+    d=d||{};
+    var t=num(d.cpu_temp_c), p=d.power, v=b?num(b.voltage):null, r=b?num(b.rate_pct_per_hour):null;
+    put($("#hTemp"), t===null ? "&mdash;"
+      : dot(LEVEL_COLOR[d.temp_level]||"var(--faint)")+Math.round(t)+" &deg;C &middot; "+esc(TEMP_WORD[d.temp_level]||""));
+    put($("#hPower"), !p ? "&mdash;"
+      : p.under_voltage_now ? dot("var(--crit)")+"Voltage too low"
+      : p.under_voltage_since_boot ? dot("var(--warn)")+"Dipped earlier" : dot("var(--ok)")+"OK");
+    txt($("#hBatt"), v===null ? "—" : v.toFixed(2)+" V"
+      + (r!==null && Math.abs(r)>=1 ? (r<0?" · draining ":" · charging ")+Math.abs(r).toFixed(0)+"%/h" : ""));
+    txt($("#hLoad"), num(d.load_pct)!==null ? d.load_pct+"%" : "—");
+    txt($("#hMem"), num(d.memory_pct)!==null ? d.memory_pct+"%" : "—");
+    txt($("#hUp"), num(d.uptime_s)!==null ? fmtDur(d.uptime_s/60) : "—");
+    txt($("#hSeen"), lastSeen!==null ? fmtAgo(now-lastSeen) : "—");
+    ["#hTemp","#hPower","#hBatt","#hLoad","#hMem","#hUp"].forEach(function(id){ $(id).classList.toggle("stale",!fresh); });
+  }
+
+  function applyStatus(res){
+    if(res && num(res.server_time)!==null) skew=res.server_time-Date.now()/1000;
+    var now=Date.now()/1000+skew;                       // "now" on the device's clock
+    var hasData=!!res && num(res.updated)!==null;
+    if(hasData){ lastGood=res; lastSeen=res.updated; }
+    var s=hasData ? res : (lastGood||{});               // offline: keep showing the last known values
+    var fresh=hasData && (now-res.updated < 8);
+    var up=num((s.device||{}).uptime_s);
+    put($("#tDevice"), fresh ? dot("var(--ok)")+"Online" : dot("var(--faint)")+"Offline");
+    txt($("#tDeviceSub"), fresh ? (up!==null ? "On for "+fmtDur(up/60) : "Connected")
+      : (lastSeen!==null ? "Last seen "+fmtAgo(now-lastSeen) : (res ? "IRIS isn't sending data" : "Can't reach the device")));
+    var b=renderBattery(s, fresh);
+    renderLocation(s.location, fresh, now);
+    renderHealth(s.device, b, fresh, now);
+    put($("#tCamera"), !fresh ? "&mdash;" : s.camera_on ? dot("var(--ok)")+"On" : dot("var(--faint)")+"Off");
+    put($("#tRecording"), !fresh ? "&mdash;" : s.recording ? dot("var(--crit)")+"Recording" : dot("var(--faint)")+"Idle");
     // Editing is only allowed in setup mode. If there's no app status at all, treat as editable.
     var locked = fresh ? !s.editing_allowed : false;
     $("#editLock").hidden = !(locked && isAdmin());    // only the admin edits, so only show it to them
@@ -721,7 +870,13 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/api/status":
             if account is None:
                 return self._send_json({"error": "Please sign in first."}, 401)
-            return self._send_json(_read_status())
+            status = _read_status()
+            if not isinstance(status, dict):
+                status = {}
+            # The device's own clock, so the page can say "last seen 3 min ago"
+            # correctly even if the phone's clock and the Pi's clock disagree.
+            status["server_time"] = time.time()
+            return self._send_json(status)
         if self.path == "/api/accounts":                 # admin: list everyone
             if not self._is_admin(account):
                 return self._send_json({"error": "Admins only."}, 403)

@@ -33,6 +33,8 @@ import emergency_calls
 # The dashcam recorder (recording.py, in the project root). Saying "start
 # recording" / "stop recording" drives it.
 import recording
+# Battery (fuel gauge), GPS location and device health for the dashboard.
+import device_status
  
  
 # ============================================================
@@ -369,40 +371,35 @@ async def _disable_editing(setup_state: SetupState) -> None:
 # ---- Live device status the dashboard reads ------------------------------
  
 STATUS_PATH = emergency_calls.CONTACTS_PATH.parent / "status.json"
- 
- 
-def _battery_percent():
-    """Real battery percent (needs psutil), or None if it can't be read."""
-    try:
-        import psutil
-        battery = psutil.sensors_battery()
-        if battery is not None:
-            return int(battery.percent)
-    except Exception:
-        pass
-    return None
+STATUS_INTERVAL_SECONDS = 1.5
  
  
 async def write_status_loop(
     peripherals: CompanionPeripherals, setup_state: SetupState
 ) -> None:
     """Write the REAL device status to status.json a few times a second, so the
-    dashboard shows live values (camera, recording, battery) instead of fakes."""
-    import json
-    while True:
-        status = {
-            "camera_on": bool(getattr(peripherals.camera, "is_on", False)),
-            "recording": recording.is_recording(),
-            "battery": _battery_percent(),
-            "editing_allowed": setup_state.active,
-            "updated": time.time(),
-        }
-        try:
-            STATUS_PATH.parent.mkdir(parents=True, exist_ok=True)
-            STATUS_PATH.write_text(json.dumps(status))
-        except OSError:
-            pass
-        await asyncio.sleep(1.5)
+    dashboard shows live values instead of fakes: camera, recording, battery
+    (fuel gauge), GPS location and device health. See device_status.py."""
+    collector = device_status.StatusCollector(getattr(peripherals, "location", None))
+    try:
+        while True:
+            status = {
+                "camera_on": bool(getattr(peripherals.camera, "is_on", False)),
+                "recording": recording.is_recording(),
+                "editing_allowed": setup_state.active,
+            }
+            try:
+                status.update(await collector.collect())
+            except Exception as error:     # the status page must never stop the device
+                print(f"[Dashboard] Status read failed: {error!r}", flush=True)
+            status["updated"] = time.time()
+            try:
+                device_status.write_status_file(STATUS_PATH, status)
+            except OSError:
+                pass
+            await asyncio.sleep(STATUS_INTERVAL_SECONDS)
+    finally:
+        collector.close()
  
  
 async def listen_for_setup_combo(
