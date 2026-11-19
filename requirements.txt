@@ -1,10 +1,27 @@
-google-genai>=1.0.0
-python-dotenv>=1.0.0
-opencv-python>=4.8.0
-sounddevice>=0.4.6
-gpiozero>=2.0
-lgpio>=0.2.2.0; platform_system == "Linux"
+# ---- Core (unchanged from before) ----
+google-genai>=1.0.0           # Gemini Live API
+python-dotenv>=1.0.0          # reads .env
+opencv-python>=4.8.0          # laptop webcam for the vision feature (pulls in numpy)
+sounddevice>=0.4.6            # microphone + speaker audio
+ 
+# ---- Buttons / GPIO (unchanged from the original) ----
+# NOTE: the macOS SIGABRT crash was caused by our code making 3 keyboard
+# listeners at once, NOT by this version. It's fixed in peripherals/mock.py
+# (one shared listener), so 1.7.6 should be fine again. If it still crashes on
+# macOS, bump this to >=1.8.2.
 pynput==1.7.6
+gpiozero>=2.0                 # GPIO buttons on the Pi
+lgpio>=0.2.2.0; platform_system == "Linux"
 pyobjc-core==11.1; platform_system == "Darwin" and python_version < "3.10"
 pyobjc-framework-Cocoa==11.1; platform_system == "Darwin" and python_version < "3.10"
 pyobjc-framework-Quartz==11.1; platform_system == "Darwin" and python_version < "3.10"
+ 
+# ---- Added for the recording feature (REQUIRED for recording with sound) ----
+imageio-ffmpeg>=0.4.9         # bundles an ffmpeg binary, so no system ffmpeg/brew needed
+ 
+# ---- Added for the dashboard battery tile (optional: without it, battery shows "—") ----
+psutil>=5.9
+ 
+# ---- Only needed when you switch emergency calls from mock to REAL Twilio ----
+# twilio>=8.0                  # uncomment when you set TWILIO_* in .env for real calls
+ 

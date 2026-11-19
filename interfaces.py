@@ -1,9 +1,9 @@
 """Contracts shared by peripheral drivers and the cloud transport."""
-
+ 
 from dataclasses import dataclass
 from typing import AsyncIterator, Protocol, runtime_checkable
-
-
+ 
+ 
 AUDIO_INPUT_SAMPLE_RATE_HZ = 16_000
 AUDIO_OUTPUT_SAMPLE_RATE_HZ = 24_000
 AUDIO_CHANNELS = 1
@@ -11,9 +11,9 @@ AUDIO_SAMPLE_WIDTH_BYTES = 2
 VIDEO_FRAME_WIDTH = 1280
 VIDEO_FRAME_HEIGHT = 720
 VIDEO_FRAMES_PER_SECOND = 1
-
-
-
+ 
+ 
+ 
 def _validate_pcm(data: bytes) -> None:
     if not isinstance(data, bytes):
         raise TypeError("PCM payload must be bytes.")
@@ -21,92 +21,92 @@ def _validate_pcm(data: bytes) -> None:
         raise ValueError("PCM payload must contain at least one sample.")
     if len(data) % AUDIO_SAMPLE_WIDTH_BYTES:
         raise ValueError("16-bit PCM payload length must be an even number of bytes.")
-
-
+ 
+ 
 @dataclass(frozen=True)
 class AudioInputFrame:
     """Mono, signed 16-bit little-endian PCM sampled at 16 kHz."""
-
+ 
     pcm: bytes
-
+ 
     def __post_init__(self) -> None:
         _validate_pcm(self.pcm)
-
-
+ 
+ 
 @dataclass(frozen=True)
 class AudioOutputFrame:
     """Mono, signed 16-bit little-endian PCM sampled at 24 kHz."""
-
+ 
     pcm: bytes
-
+ 
     def __post_init__(self) -> None:
         _validate_pcm(self.pcm)
-
-
+ 
+ 
 @dataclass(frozen=True)
 class VideoFrame:
     """A complete JPEG image downscaled to 1280x720 before delivery."""
-
+ 
     jpeg: bytes
-
+ 
     def __post_init__(self) -> None:
         if not isinstance(self.jpeg, bytes):
             raise TypeError("JPEG payload must be bytes.")
         if not self.jpeg.startswith(b"\xff\xd8") or not self.jpeg.endswith(b"\xff\xd9"):
             raise ValueError("Video frame must contain a complete JPEG image.")
-
-
+ 
+ 
 @dataclass(frozen=True)
 class ButtonEvent:
     """A button state transition delivered from an async event stream."""
-
+ 
     pressed: bool
     timestamp: float
-
+ 
     def __post_init__(self) -> None:
         if not isinstance(self.pressed, bool):
             raise TypeError("pressed must be a bool.")
         if self.timestamp < 0:
             raise ValueError("timestamp must be non-negative.")
-
-
+ 
+ 
 @runtime_checkable
 class AudioInput(Protocol):
     async def start_capture(self) -> None: ...
-
+ 
     def frames(self) -> AsyncIterator[AudioInputFrame]: ...
-
+ 
     async def stop_capture(self) -> None: ...
-
+ 
     async def close(self) -> None: ...
-
-
+ 
+ 
 @runtime_checkable
 class AudioOutput(Protocol):
     async def play(self, frame: AudioOutputFrame) -> None: ...
-
+ 
     async def interrupt(self) -> None: ...
-
+ 
     async def close(self) -> None: ...
-
+ 
 @runtime_checkable
 class Camera(Protocol):
     async def start_capture(self) -> None: ...
-
+ 
     def frames(self) -> AsyncIterator[VideoFrame]: ...
-
+ 
     async def stop_capture(self) -> None: ...
-
+ 
     async def close(self) -> None: ...
-
-
+ 
+ 
 @runtime_checkable
 class Button(Protocol):
     def events(self) -> AsyncIterator[ButtonEvent]: ...
-
+ 
     async def close(self) -> None: ...
-
-
+ 
+ 
 @runtime_checkable
 class CompanionPeripherals(Protocol):
     audio_input: AudioInput
@@ -114,7 +114,11 @@ class CompanionPeripherals(Protocol):
     camera: Camera
     talk_button: Button
     camera_button: Button
-
+    # Emergency (SOS) button -- held ~5 s to fire the alert. The laptop mock
+    # maps it to the 'e' key; the Pi will use a GPIO button.
+    emergency_button: Button
+ 
     async def start(self) -> None: ...
-
+ 
     async def close(self) -> None: ...
+ 
