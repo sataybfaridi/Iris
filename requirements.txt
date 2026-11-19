@@ -22,6 +22,9 @@ imageio-ffmpeg>=0.4.9         # bundles an ffmpeg binary, so no system ffmpeg/br
 # ---- Added for the dashboard battery tile (optional: without it, battery shows "—") ----
 psutil>=5.9
  
+# ---- Battery fuel gauge (MAX17048 on I2C) for the dashboard; Pi only ----
+smbus2>=0.4; platform_system == "Linux"
+
 # ---- Only needed when you switch emergency calls from mock to REAL Twilio ----
 # twilio>=8.0                  # uncomment when you set TWILIO_* in .env for real calls
  
