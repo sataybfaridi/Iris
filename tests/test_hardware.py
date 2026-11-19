@@ -41,11 +41,16 @@ class HardwareDriverTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsInstance(peripherals.camera, hardware.PiCamera)
         self.assertEqual(
             [device.pin for device in created_buttons],
-            [hardware.TALK_BUTTON_GPIO, hardware.CAMERA_BUTTON_GPIO],
+            [
+                hardware.TALK_BUTTON_GPIO,
+                hardware.CAMERA_BUTTON_GPIO,
+                hardware.VOLUME_UP_BUTTON_GPIO,
+                hardware.VOLUME_DOWN_BUTTON_GPIO,
+            ],
         )
         self.assertEqual(
             [device.pull_up for device in created_buttons],
-            [True, True],
+            [True, True, True, True],
         )
         await peripherals.close()
 

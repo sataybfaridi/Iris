@@ -12,6 +12,12 @@ VIDEO_FRAME_WIDTH = 1280
 VIDEO_FRAME_HEIGHT = 720
 VIDEO_FRAMES_PER_SECOND = 1
 
+# Playback volume for volume-up / volume-down buttons (software gain).
+VOLUME_MIN = 0
+VOLUME_MAX = 10
+VOLUME_DEFAULT = 7
+VOLUME_STEP = 1
+
 
 
 def _validate_pcm(data: bytes) -> None:
@@ -89,6 +95,10 @@ class AudioOutput(Protocol):
 
     async def close(self) -> None: ...
 
+    def get_volume(self) -> int: ...
+
+    def adjust_volume(self, steps: int) -> int: ...
+
 @runtime_checkable
 class Camera(Protocol):
     async def start_capture(self) -> None: ...
@@ -114,6 +124,8 @@ class CompanionPeripherals(Protocol):
     camera: Camera
     talk_button: Button
     camera_button: Button
+    volume_up_button: Button
+    volume_down_button: Button
 
     async def start(self) -> None: ...
 

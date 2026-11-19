@@ -11,8 +11,9 @@ microphone, speaker, and keyboard drivers in `peripherals/mock.py`.
 2. Copy `.env.example` to `.env` and set `GEMINI_API_KEY`.
 3. Keep `DEPLOYMENT_MODE=mock` for laptop development or set it to
    `hardware` for Raspberry Pi 5.
-4. Run `python main.py`. In mock mode, hold **Space** to talk and hold **C**
-   to stream camera frames. Release either key to stop that input.
+4. Run `python main.py`. In mock mode, hold **Space** to talk and press **C**
+   to toggle the camera. Press **Up** / **Down** for volume. Release Talk to
+   stop sending microphone audio.
 
 The mock mode sends 16 kHz mono PCM microphone audio and JPEG camera images to
 Gemini Live, and plays returned 24 kHz PCM audio through the laptop speaker.
@@ -23,10 +24,18 @@ accessibility permissions.
 Raspberry Pi hardware mode uses the wired microphone/interface configured as
 the ALSA-default input,
 the MAX98357A as the ALSA-default I2S output, and the CSI-connected Camera
-Module 3 Wide. The provisional button wiring is active-low: talk on BCM GPIO17
-and camera on BCM GPIO27, with each button connecting its GPIO pin to ground.
-Update `TALK_BUTTON_GPIO` and `CAMERA_BUTTON_GPIO` in
-`peripherals/hardware.py` to match the device wiring.
+Module 3 Wide. The provisional button wiring is active-low, each button
+connecting its GPIO pin to ground:
+
+| Button | BCM GPIO | Physical pin |
+|--------|----------|--------------|
+| Talk | 17 | 11 |
+| Camera | 27 | 13 |
+| Volume up | 23 | 16 |
+| Volume down | 24 | 18 |
+
+Update the `*_BUTTON_GPIO` constants in `peripherals/hardware.py` if your
+wiring differs. Volume is software gain on playback (levels 0–10).
 
 On Raspberry Pi OS, install Picamera2 from the OS packages (`sudo apt install
 python3-picamera2`) and use a Python environment that can import system

@@ -3,6 +3,7 @@
 Provisional assumptions (not confirmed final wiring or ALSA device names):
 - Audio capture/playback use PortAudio/ALSA defaults (`device=None`).
 - Talk button: BCM GPIO17; camera button: BCM GPIO27.
+- Volume up: BCM GPIO23; volume down: BCM GPIO24.
 - Buttons are active-low with internal pull-ups and 50 ms debounce.
 - Picamera2 is installed via apt (`python3-picamera2`), not requirements.txt.
 - Camera works with Camera Module 2 (fixed focus) and Module 3 (autofocus).
@@ -34,12 +35,15 @@ from interfaces import (
     CompanionPeripherals,
     VideoFrame,
 )
+from peripherals.volume import VolumeController
 
 logger = logging.getLogger(__name__)
 
 # Provisional GPIO assignments — update to match the device wiring.
 TALK_BUTTON_GPIO = 17
 CAMERA_BUTTON_GPIO = 27
+VOLUME_UP_BUTTON_GPIO = 23
+VOLUME_DOWN_BUTTON_GPIO = 24
 BUTTON_BOUNCE_TIME_S = 0.05
 
 
@@ -115,12 +119,20 @@ class PiAudioOutput:
         self._stream = None
         self._lock = asyncio.Lock()
         self._generation = 0
+        self._volume = VolumeController()
+
+    def get_volume(self) -> int:
+        return self._volume.get_volume()
+
+    def adjust_volume(self, steps: int) -> int:
+        return self._volume.adjust_volume(steps)
 
     async def play(self, frame: AudioOutputFrame) -> None:
         """Play one audio frame through the ALSA-default output device."""
         import sounddevice as sd
 
         generation = self._generation
+        pcm = self._volume.scale_pcm(frame.pcm)
         async with self._lock:
             if generation != self._generation:
                 return
@@ -137,7 +149,7 @@ class PiAudioOutput:
 
             stream = self._stream
             try:
-                await asyncio.to_thread(stream.write, frame.pcm)
+                await asyncio.to_thread(stream.write, pcm)
             except sd.PortAudioError:
                 if generation != self._generation:
                     return
@@ -683,6 +695,8 @@ class PiPeripherals:
         self.camera = create_camera()
         self.talk_button = create_button(TALK_BUTTON_GPIO)
         self.camera_button = create_button(CAMERA_BUTTON_GPIO)
+        self.volume_up_button = create_button(VOLUME_UP_BUTTON_GPIO)
+        self.volume_down_button = create_button(VOLUME_DOWN_BUTTON_GPIO)
 
     async def start(self) -> None:
         """Audio starts when Talk is held; the camera when its button is pressed."""
@@ -693,6 +707,8 @@ class PiPeripherals:
         await self.camera.close()
         await self.talk_button.close()
         await self.camera_button.close()
+        await self.volume_up_button.close()
+        await self.volume_down_button.close()
 
 
 def create_peripherals(_settings: Settings) -> CompanionPeripherals:

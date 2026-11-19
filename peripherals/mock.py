@@ -25,6 +25,7 @@ from interfaces import (
     CompanionPeripherals,
     VideoFrame,
 )
+from peripherals.volume import VolumeController
 
 logger = logging.getLogger(__name__)
 
@@ -115,11 +116,19 @@ class LaptopAudioOutput:
         self._stream = None
         self._lock = asyncio.Lock()
         self._generation = 0
+        self._volume = VolumeController()
+
+    def get_volume(self) -> int:
+        return self._volume.get_volume()
+
+    def adjust_volume(self, steps: int) -> int:
+        return self._volume.adjust_volume(steps)
 
     async def play(self, frame: AudioOutputFrame) -> None:
         """Play one audio frame through the laptop speaker."""
 
         generation = self._generation
+        pcm = self._volume.scale_pcm(frame.pcm)
         async with self._lock:
             # Drop frames that were already waiting to play when an interrupt
             # arrived, rather than replaying stale Gemini audio afterward.
@@ -136,7 +145,7 @@ class LaptopAudioOutput:
 
             stream = self._stream
             try:
-                await asyncio.to_thread(stream.write, frame.pcm)
+                await asyncio.to_thread(stream.write, pcm)
             except sd.PortAudioError:
                 if generation != self._generation:
                     return
@@ -668,6 +677,8 @@ class LaptopPeripherals:
         self.camera_button = create_button(
             keyboard.KeyCode.from_char("c")
         )
+        self.volume_up_button = create_button(keyboard.Key.up)
+        self.volume_down_button = create_button(keyboard.Key.down)
 
     async def start(self) -> None:
         """Defer audio and camera capture until their buttons are held."""
@@ -678,6 +689,8 @@ class LaptopPeripherals:
         await self.camera.close()
         await self.talk_button.close()
         await self.camera_button.close()
+        await self.volume_up_button.close()
+        await self.volume_down_button.close()
 
 def create_peripherals(_settings: Settings) -> CompanionPeripherals:
     """Build the laptop peripheral bundle used for mock development."""

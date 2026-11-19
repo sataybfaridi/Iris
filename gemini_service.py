@@ -18,6 +18,9 @@ from vision_tools import (
 from interfaces import (
     AUDIO_OUTPUT_SAMPLE_RATE_HZ,
     VIDEO_FRAMES_PER_SECOND,
+    VOLUME_MAX,
+    VOLUME_STEP,
+    AudioOutput,
     AudioOutputFrame,
     Button,
     CompanionPeripherals,
@@ -430,6 +433,22 @@ async def listen_for_button_events(
                 play_sound=lambda pcm: _play_sound(peripherals, pcm, background),
             )
         ),
+        asyncio.create_task(
+            listen_for_volume_button(
+                peripherals.volume_up_button,
+                peripherals.audio_output,
+                steps=VOLUME_STEP,
+                label="up",
+            )
+        ),
+        asyncio.create_task(
+            listen_for_volume_button(
+                peripherals.volume_down_button,
+                peripherals.audio_output,
+                steps=-VOLUME_STEP,
+                label="down",
+            )
+        ),
     )
     try:
         done, _ = await asyncio.wait(
@@ -446,6 +465,22 @@ async def listen_for_button_events(
             if not task.done():
                 task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
+
+
+async def listen_for_volume_button(
+    button: Button,
+    audio_output: AudioOutput,
+    *,
+    steps: int,
+    label: str,
+) -> None:
+    """Press once to nudge playback volume up or down."""
+    events = button.events().__aiter__()
+    while True:
+        event = await anext(events)
+        if event.pressed:
+            level = audio_output.adjust_volume(steps)
+            print(f"[Live] Volume {label}: {level}/{VOLUME_MAX}.", flush=True)
 
 
 async def listen_for_capture_button(
