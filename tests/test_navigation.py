@@ -10,6 +10,7 @@ from unittest.mock import patch
 from interfaces import LocationFix
 from location import navigation
 from location.navigation import (
+    APPROACH_MIN_STEP_METERS,
     FIVE_FEET_METERS,
     OFF_ROUTE_CUE,
     NavigationController,
@@ -58,6 +59,15 @@ class TurnGuideTests(unittest.TestCase):
         self.assertEqual(cues[0], "In 5 feet, you will arrive")
         self.assertEqual(cues[-1], "You have arrived.")
 
+    def test_short_steps_skip_approach_warning(self) -> None:
+        guide = TurnGuide(
+            [("Head north", APPROACH_MIN_STEP_METERS - 1), ("Turn left", 6)]
+        )
+        guide.start_cues()
+        cues = guide.advance(APPROACH_MIN_STEP_METERS)
+        self.assertNotIn("In 5 feet, turn left", cues)
+        self.assertIn("Turn left", cues)
+
     def test_payload_hides_the_rest_of_the_route(self) -> None:
         payload = navigation_payload(
             {
@@ -89,7 +99,7 @@ class NavigationSessionTests(unittest.IsolatedAsyncioTestCase):
         ):
             first = controller.start(
                 [
-                    {"instruction": "Head north", "distance_meters": 5},
+                    {"instruction": "Head north", "distance_meters": 20},
                     {"instruction": "Turn left", "distance_meters": 1},
                 ]
             )
@@ -254,6 +264,7 @@ class GpsNavigationTests(unittest.IsolatedAsyncioTestCase):
 
         with (
             patch.object(navigation, "TICK_SECONDS", 0.01),
+            patch.object(navigation, "GPS_START_GRACE_SECONDS", 0),
             patch.object(
                 navigation.RouteGeometry, "from_route_steps", fake_from_steps
             ),
@@ -269,6 +280,43 @@ class GpsNavigationTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("Head north", spoken)
         self.assertLessEqual(spoken.count("In 5 feet, turn left"), 1)
         self.assertIn("Turn left", spoken)
+
+    async def test_gps_teleport_resyncs_without_dumping_cues(self) -> None:
+        controller = NavigationController(lambda _phrase: None, use_gps=True)
+        geometry = RouteGeometry([(37.0, -122.0), (37.001, -122.0)])
+        guide = TurnGuide([("Head north", 100), ("Turn left", 10)])
+        guide.start_cues()
+        # First fix near the start.
+        along_a, cues_a = controller._progress_from_fix(
+            guide,
+            geometry,
+            LocationFix(37.0, -122.0, 5, timestamp=1),
+            0.0,
+        )
+        self.assertEqual(cues_a, [])
+        # Huge jump along the route: resync, do not fire every intermediate cue.
+        along_b, cues_b = controller._progress_from_fix(
+            guide,
+            geometry,
+            LocationFix(37.0008, -122.0, 5, timestamp=2),
+            along_a,
+        )
+        self.assertEqual(cues_b, [])
+        self.assertGreater(along_b, along_a)
+
+    async def test_poor_accuracy_does_not_advance(self) -> None:
+        controller = NavigationController(lambda _phrase: None, use_gps=True)
+        geometry = RouteGeometry([(37.0, -122.0), (37.001, -122.0)])
+        guide = TurnGuide([("Head north", 100)])
+        guide.start_cues()
+        along, cues = controller._progress_from_fix(
+            guide,
+            geometry,
+            LocationFix(37.0005, -122.0, 40, timestamp=1),
+            0.0,
+        )
+        self.assertEqual(along, 0.0)
+        self.assertEqual(cues, [])
 
     async def test_off_route_cancels_with_one_cue(self) -> None:
         spoken = []
@@ -299,6 +347,7 @@ class GpsNavigationTests(unittest.IsolatedAsyncioTestCase):
 
         with (
             patch.object(navigation, "TICK_SECONDS", 0.01),
+            patch.object(navigation, "GPS_START_GRACE_SECONDS", 0),
             patch.object(
                 navigation.RouteGeometry, "from_route_steps", fake_from_steps
             ),

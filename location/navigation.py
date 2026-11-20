@@ -21,6 +21,14 @@ TICK_SECONDS = 0.5
 OFF_ROUTE_METERS = 25.0
 ARRIVAL_METERS = 15.0
 EARTH_RADIUS_METERS = 6_371_000.0
+# Skip "In 5 feet…" on tiny Google steps; GPS noise is larger than the step.
+APPROACH_MIN_STEP_METERS = 8.0
+# Single-fix jumps larger than this resync without dumping every cue.
+GPS_TELEPORT_METERS = 20.0
+# Hold progress while the fix is too fuzzy to trust near a short warn distance.
+GPS_MAX_ACCURACY_TO_ADVANCE_METERS = 25.0
+# Let Gemini finish speaking the opening instruction before GPS cues start.
+GPS_START_GRACE_SECONDS = 2.5
 
 SpeakCue = Callable[[str], Awaitable[None]]
 OFF_ROUTE_CUE = "You seem off the route. Navigation stopped."
@@ -232,6 +240,7 @@ class TurnGuide:
             if (
                 not self._warned
                 and upcoming is not None
+                and length >= APPROACH_MIN_STEP_METERS
                 and length > FIVE_FEET_METERS
                 and self._into < warn_at
             ):
@@ -282,9 +291,11 @@ class NavigationController:
         *,
         location: Location | None = None,
         use_gps: bool = False,
+        model_idle: asyncio.Event | None = None,
     ) -> None:
         self._speak = speak
         self._idle = idle
+        self._model_idle = model_idle
         self._location = location
         self._use_gps = use_gps
         self._guide: TurnGuide | None = None
@@ -319,6 +330,8 @@ class NavigationController:
     async def _emit(self, guide: TurnGuide, cue: str) -> None:
         if self._idle is not None:
             await self._idle.wait()
+        if self._model_idle is not None:
+            await self._model_idle.wait()
         if self._guide is not guide:
             return
         await self._speak(cue)
@@ -341,6 +354,10 @@ class NavigationController:
     async def _follow_gps(self, guide: TurnGuide, geometry: RouteGeometry) -> None:
         last_along = 0.0
         try:
+            if GPS_START_GRACE_SECONDS > 0:
+                await asyncio.sleep(GPS_START_GRACE_SECONDS)
+            if self._model_idle is not None:
+                await self._model_idle.wait()
             while self._guide is guide and not guide.finished:
                 await asyncio.sleep(TICK_SECONDS)
                 if self._guide is not guide:
@@ -392,8 +409,17 @@ class NavigationController:
                     cues.append("You have arrived.")
             return geometry.total_meters, cues
 
+        # Fuzzy fixes jump around the polyline; don't treat noise as walking.
+        if fix.accuracy_meters > GPS_MAX_ACCURACY_TO_ADVANCE_METERS:
+            return last_along, []
+
         delta = max(0.0, along - last_along)
-        if delta > 0:
-            cues.extend(guide.advance(delta))
-            last_along = along
-        return last_along, cues
+        if delta <= 0:
+            return last_along, []
+        teleport_limit = max(GPS_TELEPORT_METERS, fix.accuracy_meters * 1.5)
+        if delta > teleport_limit:
+            # Resync to the new along-route position without firing skipped cues.
+            return along, []
+
+        cues.extend(guide.advance(delta))
+        return along, cues

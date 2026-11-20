@@ -80,16 +80,27 @@ async def stream_live_session(
     state = VisionState()
     user_idle = asyncio.Event()
     user_idle.set()
+    model_idle = asyncio.Event()
+    model_idle.set()
+    nav_cue_lock = asyncio.Lock()
     navigator = NavigationController(
-        lambda phrase: speak_navigation_cue(session, phrase),
+        lambda phrase: speak_navigation_cue(
+            session, phrase, model_idle=model_idle, cue_lock=nav_cue_lock
+        ),
         idle=user_idle,
         location=peripherals.location,
         use_gps=use_gps,
+        model_idle=model_idle,
     )
     tasks = (
         asyncio.create_task(
             receive_live_responses(
-                session, peripherals, state, maps_api_key, navigator
+                session,
+                peripherals,
+                state,
+                maps_api_key,
+                navigator,
+                model_idle=model_idle,
             )
         ),
         asyncio.create_task(
@@ -116,14 +127,49 @@ async def stream_live_session(
         await asyncio.gather(*tasks, return_exceptions=True)
 
 
-async def speak_navigation_cue(session: Any, phrase: str) -> None:
-    """Ask Gemini to say one GPS sentence and nothing else."""
+async def speak_navigation_cue(
+    session: Any,
+    phrase: str,
+    *,
+    model_idle: asyncio.Event | None = None,
+    cue_lock: asyncio.Lock | None = None,
+) -> None:
+    """Ask Gemini to say one GPS sentence and nothing else.
+
+    Serialized and gated on model_idle so cues do not overlap Gemini's
+    current spoken turn (which triggers Live WebSocket 1007).
+    """
     from google.genai import types
 
-    print(f"[Navigation] {phrase}", flush=True)
-    await session.send_realtime_input(activity_start=types.ActivityStart())
-    await session.send_realtime_input(text=f"[Navigation cue: {phrase}]")
-    await session.send_realtime_input(activity_end=types.ActivityEnd())
+    lock = cue_lock if cue_lock is not None else asyncio.Lock()
+    async with lock:
+        if model_idle is not None:
+            await model_idle.wait()
+            model_idle.clear()
+        print(f"[Navigation] {phrase}", flush=True)
+        try:
+            await session.send_realtime_input(activity_start=types.ActivityStart())
+            await session.send_realtime_input(text=f"[Navigation cue: {phrase}]")
+            # Tiny pad so the turn is never an empty audio activity.
+            await session.send_realtime_input(
+                audio=types.Blob(
+                    data=NAV_CUE_SILENCE_PCM, mime_type="audio/pcm;rate=16000"
+                )
+            )
+            await session.send_realtime_input(activity_end=types.ActivityEnd())
+            if model_idle is not None:
+                try:
+                    await asyncio.wait_for(model_idle.wait(), timeout=45.0)
+                except asyncio.TimeoutError:
+                    model_idle.set()
+                    print(
+                        "[Navigation] Timed out waiting for cue playback.",
+                        flush=True,
+                    )
+        except Exception as error:
+            if model_idle is not None and not model_idle.is_set():
+                model_idle.set()
+            print(f"[Navigation] Cue send failed: {error!r}", flush=True)
 
 
 async def send_audio_frames(
@@ -179,13 +225,20 @@ async def receive_live_responses(
     state: VisionState | None = None,
     maps_api_key: str = "",
     navigator: NavigationController | None = None,
+    model_idle: asyncio.Event | None = None,
 ) -> None:
     """Receive model events independently from speaker playback."""
     audio_queue: asyncio.Queue[AudioOutputFrame] = asyncio.Queue()
     tasks = (
         asyncio.create_task(
             receive_live_events(
-                session, peripherals, audio_queue, state, maps_api_key, navigator
+                session,
+                peripherals,
+                audio_queue,
+                state,
+                maps_api_key,
+                navigator,
+                model_idle=model_idle,
             ),
             name="gemini-live-receiver",
         ),
@@ -220,6 +273,7 @@ async def receive_live_events(
     state: VisionState | None = None,
     maps_api_key: str = "",
     navigator: NavigationController | None = None,
+    model_idle: asyncio.Event | None = None,
 ) -> None:
     """Receive complete model turns continuously and enqueue their audio."""
     if state is None:
@@ -257,6 +311,7 @@ async def receive_live_events(
                 peripherals,
                 audio_queue,
                 speaking=speaking,
+                model_idle=model_idle,
             )
 
         if not received_response:
@@ -339,6 +394,7 @@ async def handle_live_response(
     peripherals: CompanionPeripherals,
     audio_queue: asyncio.Queue[AudioOutputFrame],
     speaking: bool = False,
+    model_idle: asyncio.Event | None = None,
 ) -> bool:
     """Queue PCM chunks, or flush queued/current audio on interruption."""
     server_content = response.server_content
@@ -364,6 +420,8 @@ async def handle_live_response(
         if speaking:
             print("[Live] Interrupted: stopped Gemini playback.", flush=True)
         speaking = False
+        if model_idle is not None:
+            model_idle.set()
 
     model_turn = server_content.model_turn
     if model_turn is not None:
@@ -386,12 +444,18 @@ async def handle_live_response(
             if not speaking:
                 print("[Live] Speaking: playing Gemini audio.", flush=True)
                 speaking = True
+                if model_idle is not None:
+                    model_idle.clear()
 
             audio_queue.put_nowait(AudioOutputFrame(pcm=inline_data.data))
 
-    if speaking and server_content.turn_complete:
-        print("[Live] Gemini finished speaking.", flush=True)
-        speaking = False
+    if server_content.turn_complete:
+        if speaking:
+            print("[Live] Gemini finished speaking.", flush=True)
+            speaking = False
+        # Always release waiters (nav cues) even for text-only / empty turns.
+        if model_idle is not None:
+            model_idle.set()
 
     return speaking
 
@@ -413,6 +477,8 @@ CAMERA_OFF_NOTE = (
 MIN_TALK_S = 1.0
 # 0.5 s of silence: 16 kHz, mono, 16-bit = 2 bytes per sample.
 SILENCE_PCM = bytes(16000 * 2 // 2)
+# Short pad so navigation cue turns are never empty audio activities.
+NAV_CUE_SILENCE_PCM = bytes(16000 * 2 // 10)  # 0.1 s
 
 
 async def listen_for_button_events(

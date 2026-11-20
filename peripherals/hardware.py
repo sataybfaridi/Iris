@@ -696,9 +696,14 @@ class NeoM8NLocation:
 
             try:
                 while not self._stop.is_set():
+                    serial_port = self._serial
+                    if serial_port is None:
+                        break
                     try:
-                        raw = self._serial.readline()
+                        raw = serial_port.readline()
                     except Exception as error:
+                        if self._stop.is_set():
+                            break
                         message = str(error).strip() or "GPS is disconnected."
                         with self._lock:
                             self._error = "GPS is disconnected."
@@ -757,12 +762,8 @@ class NeoM8NLocation:
     async def close(self) -> None:
         """Stop the reader thread and close the serial port."""
         self._stop.set()
-        serial_port = self._serial
-        if serial_port is not None:
-            try:
-                serial_port.close()
-            except Exception:
-                pass
+        # Null the handle before close so the reader loop stops calling readline.
+        self._close_serial()
         thread = self._thread
         self._thread = None
         if thread is not None and thread.is_alive():
