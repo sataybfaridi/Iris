@@ -32,6 +32,10 @@ from vision.tools import (
 )
 
 
+LIVE_CONNECT_ATTEMPTS = 3
+LIVE_CONNECT_RETRY_SECONDS = 2.0
+
+
 async def run_gemini_live(
     settings: Settings, peripherals: CompanionPeripherals
 ) -> None:
@@ -40,33 +44,60 @@ async def run_gemini_live(
     from google.genai import types
 
     client = genai.Client(api_key=settings.gemini_api_key)
-    async with client.aio.live.connect(
-        model=settings.gemini_live_model,
-        config=types.LiveConnectConfig(
-            response_modalities=["AUDIO"],
-            # Let Gemini see pictures at full quality (small label text).
-            media_resolution=types.MediaResolution.MEDIA_RESOLUTION_HIGH,
-            # Camera tools + rules. The laptop webcam faces you, so left and
-            # right are flipped; the Pi camera points away like a phone.
-            system_instruction=build_system_instruction(
-                camera_faces_user=settings.mode is DeploymentMode.MOCK
-            ),
-            tools=[build_camera_tools(types), build_location_tools(types)],
-            realtime_input_config=types.RealtimeInputConfig(
-                automatic_activity_detection=types.AutomaticActivityDetection(
-                    disabled=True
-                )
-            ),
-            input_audio_transcription=types.AudioTranscriptionConfig(),
-            output_audio_transcription=types.AudioTranscriptionConfig(),
+    live_config = types.LiveConnectConfig(
+        response_modalities=["AUDIO"],
+        # Let Gemini see pictures at full quality (small label text).
+        media_resolution=types.MediaResolution.MEDIA_RESOLUTION_HIGH,
+        # Camera tools + rules. The laptop webcam faces you, so left and
+        # right are flipped; the Pi camera points away like a phone.
+        system_instruction=build_system_instruction(
+            camera_faces_user=settings.mode is DeploymentMode.MOCK
         ),
-    ) as session:
-        await stream_live_session(
-            peripherals,
-            session,
-            settings.google_maps_api_key,
-            use_gps=settings.mode is DeploymentMode.HARDWARE,
-        )
+        tools=[build_camera_tools(types), build_location_tools(types)],
+        realtime_input_config=types.RealtimeInputConfig(
+            automatic_activity_detection=types.AutomaticActivityDetection(
+                disabled=True
+            )
+        ),
+        input_audio_transcription=types.AudioTranscriptionConfig(),
+        output_audio_transcription=types.AudioTranscriptionConfig(),
+    )
+
+    last_error: BaseException | None = None
+    for attempt in range(1, LIVE_CONNECT_ATTEMPTS + 1):
+        try:
+            print(
+                f"[Live] Connecting to Gemini ({settings.gemini_live_model})"
+                f" attempt {attempt}/{LIVE_CONNECT_ATTEMPTS}…",
+                flush=True,
+            )
+            async with client.aio.live.connect(
+                model=settings.gemini_live_model,
+                config=live_config,
+            ) as session:
+                print("[Live] Connected.", flush=True)
+                await stream_live_session(
+                    peripherals,
+                    session,
+                    settings.google_maps_api_key,
+                    use_gps=settings.mode is DeploymentMode.HARDWARE,
+                )
+            return
+        except (TimeoutError, OSError, ConnectionError) as error:
+            last_error = error
+            print(
+                f"[Live] Connect failed: {error!r}",
+                flush=True,
+            )
+            if attempt < LIVE_CONNECT_ATTEMPTS:
+                await asyncio.sleep(LIVE_CONNECT_RETRY_SECONDS)
+
+    raise ConnectionError(
+        "Timed out opening the Gemini Live WebSocket after "
+        f"{LIVE_CONNECT_ATTEMPTS} attempts. Check Pi internet "
+        "(ping/DNS), firewall, and that GEMINI_API_KEY / "
+        "GEMINI_LIVE_MODEL are valid."
+    ) from last_error
 
 
 async def stream_live_session(
