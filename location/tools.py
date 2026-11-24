@@ -25,20 +25,25 @@ LOCATION_TOOL_NAMES = frozenset({LOCATION_TOOL, DIRECTIONS_TOOL, NEARBY_TOOL})
 LOCATION_INSTRUCTION = """
 
 Location and directions:
+- Speak all location and navigation text in English only. Never translate \
+turn-by-turn cues, street names, or destination confirmations into Spanish \
+or another language unless the user clearly asks for that language.
 - If the user asks where they are, call get_current_location. Then speak \
 the latitude, longitude, and accuracy in meters. Do not invent a position.
 - If the user asks how to get to a named place, call get_directions with \
-that place name. The result contains say_now. Speak only that one sentence, \
-like a GPS starting a trip. Do not read later steps, the total distance, \
-or a list. Do not invent a route or a street.
+that place name. The result contains say_now, which already confirms the \
+destination and gives the first maneuver. Speak that full say_now text in \
+English exactly as written, like a GPS starting a trip. Do not drop the \
+confirmation. Do not read later steps, the total distance, or a list. Do \
+not invent a route or a street.
 - If the user asks for the nearest kind of place, how far it is, or \
 directions to it (for example "nearest gas station"), call \
 find_nearby_place with the kind of place, such as "gas station". Speak \
-the place name and then only say_now. Do not read the rest of the route. \
-Do not invent a place.
+only say_now (it already names the place and confirms the destination). \
+Do not read the rest of the route. Do not invent a place.
 - A message that starts with "[Navigation cue:" is the next GPS prompt. \
-Speak only the sentence after the colon, then stop. Do not add any other \
-step or summarize the route.
+Speak only the sentence after the colon, in English exactly as written, \
+then stop. Do not add any other step, translate it, or summarize the route.
 - If a location, nearby, or directions result has status "error", say that \
 message in your own short words. Do not guess a location, a place, or a route.
 - Do not read tool names out loud.
@@ -62,7 +67,8 @@ def build_location_tools(types: Any) -> Any:
                 description=(
                     "Start turn-by-turn walking navigation from the current "
                     "GPS fix to a place the user named. Speak only the "
-                    "say_now sentence. Later cues arrive on their own. "
+                    "say_now sentence in English; it already confirms the "
+                    "destination. Later cues arrive on their own. "
                     "Do not invent a route or list the steps."
                 ),
                 parameters=types.Schema(
@@ -84,7 +90,8 @@ def build_location_tools(types: Any) -> Any:
                 description=(
                     "Find the closest place of a given kind, such as a gas "
                     "station, and start turn-by-turn walking navigation to "
-                    "it. Speak the place name and only the say_now sentence. "
+                    "it. Speak only the say_now sentence in English; it "
+                    "already names and confirms the destination. "
                     "Do not invent a place or list the steps."
                 ),
                 parameters=types.Schema(
@@ -157,16 +164,46 @@ async def run_location_tool(
     return {"status": "error", "message": f"No tool named {name}."}
 
 
+def destination_label(result: dict[str, Any]) -> str:
+    """Speakable place name for confirming where navigation is going."""
+    name = str(result.get("name") or "").strip()
+    destination = str(result.get("destination") or "").strip()
+    address = str(result.get("address") or "").strip()
+    if name:
+        if address and address.casefold() != name.casefold():
+            return f"{name} at {address}"
+        return name
+    return destination or address
+
+
+def confirm_navigation_say_now(result: dict[str, Any], say_now: str) -> str:
+    """Prefix the first cue with an explicit destination confirmation."""
+    label = destination_label(result)
+    cue = " ".join(str(say_now or "").split())
+    if not label:
+        return cue
+    if not cue:
+        return f"Confirming destination: {label}."
+    return f"Confirming destination: {label}. {cue}"
+
+
 def navigation_payload(result: dict[str, Any], say_now: str) -> dict[str, Any]:
     """What Gemini may see: the first cue only, not the rest of the route."""
+    confirmed = confirm_navigation_say_now(result, say_now)
+    label = destination_label(result)
     payload = {
         "status": "ok",
         "navigation": "started",
-        "say_now": say_now,
+        "say_now": confirmed,
         "total_distance": result.get("total_distance", ""),
         "total_duration": result.get("total_duration", ""),
-        "message": "Speak only say_now. Do not list later steps.",
+        "message": (
+            "Speak say_now in English exactly as written. "
+            "Do not translate it. Do not list later steps."
+        ),
     }
+    if label:
+        payload["destination"] = label
     if result.get("name"):
         payload["name"] = result["name"]
     if result.get("address"):

@@ -80,7 +80,11 @@ class TurnGuideTests(unittest.TestCase):
             },
             "Head north",
         )
-        self.assertEqual(payload["say_now"], "Head north")
+        self.assertEqual(
+            payload["say_now"],
+            "Confirming destination: Shell at 123 Main St. Head north",
+        )
+        self.assertEqual(payload["destination"], "Shell at 123 Main St")
         self.assertNotIn("steps", payload)
         self.assertEqual(payload["name"], "Shell")
 
@@ -189,7 +193,11 @@ class NavigationSessionTests(unittest.IsolatedAsyncioTestCase):
             )
 
         response = session.responses[0].response
-        self.assertEqual(response["say_now"], "Head north")
+        self.assertEqual(
+            response["say_now"],
+            "Confirming destination: the pharmacy. Head north",
+        )
+        self.assertEqual(response["destination"], "the pharmacy")
         self.assertNotIn("steps", response)
         self.assertEqual(navigator.steps[0]["instruction"], "Head north")
         self.assertEqual(navigator.steps[0]["distance_meters"], 200)

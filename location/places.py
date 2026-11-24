@@ -38,7 +38,8 @@ def nearby_request_body(origin: LocationFix, query: str) -> dict[str, Any]:
         "textQuery": query,
         "rankPreference": "DISTANCE",
         "maxResultCount": 1,
-        "languageCode": "en",
+        "languageCode": "en-US",
+        "regionCode": "us",
         "locationBias": {
             "circle": {
                 "center": {

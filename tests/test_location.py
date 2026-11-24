@@ -131,6 +131,8 @@ class LocationTests(unittest.IsolatedAsyncioTestCase):
         body = routes_request_body(origin, "the pharmacy")
         self.assertEqual(body["travelMode"], "WALK")
         self.assertEqual(body["destination"]["address"], "the pharmacy")
+        self.assertEqual(body["languageCode"], "en-US")
+        self.assertEqual(body["regionCode"], "US")
         self.assertEqual(
             body["origin"]["location"]["latLng"],
             {"latitude": 37.7, "longitude": -122.4},
@@ -234,6 +236,8 @@ class LocationTests(unittest.IsolatedAsyncioTestCase):
         body = nearby_request_body(origin, "gas station")
         self.assertEqual(body["textQuery"], "gas station")
         self.assertEqual(body["rankPreference"], "DISTANCE")
+        self.assertEqual(body["languageCode"], "en-US")
+        self.assertEqual(body["regionCode"], "us")
         self.assertEqual(
             body["locationBias"]["circle"]["center"],
             {"latitude": 40.7128, "longitude": -74.006},

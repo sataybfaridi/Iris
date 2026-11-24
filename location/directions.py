@@ -48,6 +48,7 @@ def routes_request_body(origin: LocationFix, destination: str) -> dict[str, Any]
         "destination": {"address": destination},
         "travelMode": "WALK",
         "languageCode": "en-US",
+        "regionCode": "US",
         "units": "METRIC",
     }
 
