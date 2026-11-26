@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import math
+import time
 from collections.abc import Awaitable, Callable
 from typing import Any
 
@@ -19,19 +20,30 @@ FIVE_FEET_METERS = 5 * 0.3048
 WALK_METERS_PER_SECOND = 1.4
 TICK_SECONDS = 0.5
 OFF_ROUTE_METERS = 25.0
+# Looser while the walker is still finishing a corner after a turn cue.
+CORNER_OFF_ROUTE_METERS = 45.0
+CORNER_GRACE_SECONDS = 10.0
+# Brief GPS blips past the polyline must persist before navigation stops.
+OFF_ROUTE_HOLD_SECONDS = 4.0
 ARRIVAL_METERS = 15.0
 EARTH_RADIUS_METERS = 6_371_000.0
 # Skip "In 5 feet…" on tiny Google steps; GPS noise is larger than the step.
 APPROACH_MIN_STEP_METERS = 8.0
+# After a turn, preview the next maneuver once the walker is into the new leg.
+ON_ROUTE_CONFIRM_METERS = 10.0
 # Single-fix jumps larger than this resync without dumping every cue.
 GPS_TELEPORT_METERS = 20.0
 # Hold progress while the fix is too fuzzy to trust near a short warn distance.
 GPS_MAX_ACCURACY_TO_ADVANCE_METERS = 25.0
 # Let Gemini finish speaking the opening instruction before GPS cues start.
 GPS_START_GRACE_SECONDS = 2.5
+# Speak once when GPS stays unavailable during an active trip.
+GPS_LOST_BEFORE_SPEAK_SECONDS = 3.0
 
 SpeakCue = Callable[[str], Awaitable[None]]
 OFF_ROUTE_CUE = "You seem off the route. Navigation stopped."
+GPS_LOST_CUE = "GPS signal lost. Holding navigation."
+GPS_BACK_CUE = "GPS is back. Continuing."
 
 
 def approach_phrase(instruction: str) -> str:
@@ -40,6 +52,15 @@ def approach_phrase(instruction: str) -> str:
         return "In 5 feet, continue."
     lowered = instruction[0].lower() + instruction[1:]
     return f"In 5 feet, {lowered}"
+
+
+def next_preview_phrase(instruction: str) -> str:
+    """Spoken ~10 m after a turn to preview the upcoming maneuver."""
+    text = " ".join(str(instruction or "").split())
+    if not text:
+        return "Next: continue."
+    lowered = text[0].lower() + text[1:]
+    return f"Next: {lowered}"
 
 
 def decode_polyline(encoded: str) -> list[tuple[float, float]]:
@@ -199,6 +220,7 @@ class TurnGuide:
         self._index = 0
         self._into = 0.0
         self._warned = False
+        self._confirm_pending = False
         self.finished = not self._steps
 
     @classmethod
@@ -214,6 +236,24 @@ class TurnGuide:
                 )
             )
         return cls(parsed)
+
+    @property
+    def current_instruction(self) -> str:
+        if self.finished or self._index >= len(self._steps):
+            return ""
+        return self._steps[self._index][0]
+
+    @property
+    def next_instruction(self) -> str:
+        if self._index + 1 < len(self._steps):
+            return self._steps[self._index + 1][0]
+        return ""
+
+    @property
+    def meters_remaining_on_step(self) -> float:
+        if self.finished or self._index >= len(self._steps):
+            return 0.0
+        return max(0.0, self._steps[self._index][1] - self._into)
 
     def start_cues(self) -> list[str]:
         """The only line to speak when navigation begins."""
@@ -248,17 +288,20 @@ class TurnGuide:
                 if remaining < until_warn:
                     self._into += remaining
                     remaining = 0
+                    cues.extend(self._maybe_on_route_confirm())
                     break
                 self._into += until_warn
                 remaining -= until_warn
                 self._warned = True
                 cues.append(approach_phrase(upcoming))
+                cues.extend(self._maybe_on_route_confirm())
                 continue
 
             until_end = length - self._into
             if remaining < until_end:
                 self._into += remaining
                 remaining = 0
+                cues.extend(self._maybe_on_route_confirm())
                 break
             remaining -= until_end
             cues.extend(self._complete_step())
@@ -269,15 +312,29 @@ class TurnGuide:
             return self._steps[self._index + 1][0]
         return "you will arrive"
 
+    def _maybe_on_route_confirm(self) -> list[str]:
+        if (
+            self._confirm_pending
+            and not self.finished
+            and self._into >= ON_ROUTE_CONFIRM_METERS
+        ):
+            self._confirm_pending = False
+            upcoming = self._upcoming_phrase() or "continue"
+            return [next_preview_phrase(upcoming)]
+        return []
+
     def _complete_step(self) -> list[str]:
         self._index += 1
         self._into = 0.0
         self._warned = False
         if self._index >= len(self._steps):
             self.finished = True
+            self._confirm_pending = False
             if self._steps and "arriv" in self._steps[-1][0].lower():
                 return []
             return ["You have arrived."]
+        # After each turn, preview the upcoming maneuver once the walker is into the leg.
+        self._confirm_pending = True
         return [self._steps[self._index][0]]
 
 
@@ -300,14 +357,24 @@ class NavigationController:
         self._use_gps = use_gps
         self._guide: TurnGuide | None = None
         self._task: asyncio.Task[None] | None = None
+        self._destination = ""
+        self._last_on_route: bool | None = None
+        self._last_distance_to_route_m: float | None = None
+        self._geometry_total_m = 0.0
+        self._last_along_m = 0.0
 
-    def start(self, steps: list[dict[str, Any]]) -> str:
+    def start(self, steps: list[dict[str, Any]], *, destination: str = "") -> str:
         """Begin a route. Returns the first instruction and does not speak it."""
         self.cancel()
         guide = TurnGuide.from_route_steps(steps)
         self._guide = guide
+        self._destination = str(destination or "").strip()
+        self._last_on_route = True
+        self._last_distance_to_route_m = 0.0
+        self._last_along_m = 0.0
         first = guide.start_cues()
         geometry = RouteGeometry.from_route_steps(steps)
+        self._geometry_total_m = geometry.total_meters if geometry is not None else 0.0
         if self._use_gps and self._location is not None and geometry is not None:
             self._task = asyncio.create_task(
                 self._follow_gps(guide, geometry),
@@ -327,6 +394,55 @@ class NavigationController:
         if task is not None and not task.done():
             task.cancel()
 
+    def is_active(self) -> bool:
+        guide = self._guide
+        task = self._task
+        return (
+            guide is not None
+            and not guide.finished
+            and task is not None
+            and not task.done()
+        )
+
+    def status(self) -> dict[str, Any]:
+        """Speakable snapshot for get_navigation_status."""
+        if not self.is_active():
+            return {
+                "status": "ok",
+                "active": False,
+                "navigation": "off",
+                "message": (
+                    "Navigation is not running. Say that clearly in English. "
+                    "Do not invent a route status."
+                ),
+            }
+
+        guide = self._guide
+        assert guide is not None
+        remaining_route = max(0.0, self._geometry_total_m - self._last_along_m)
+        on_route = self._last_on_route
+        payload: dict[str, Any] = {
+            "status": "ok",
+            "active": True,
+            "navigation": "on",
+            "destination": self._destination,
+            "on_route": on_route if on_route is not None else True,
+            "current_instruction": guide.current_instruction,
+            "next_instruction": guide.next_instruction,
+            "meters_remaining_on_step": round(guide.meters_remaining_on_step, 1),
+            "meters_remaining_on_route": round(remaining_route, 1),
+            "message": (
+                "Speak a short English answer from this status only. "
+                "If on_route is true, say they are going the right way and "
+                "mention the current or next instruction. "
+                "If on_route is false, say they may be off the route. "
+                "Do not invent details."
+            ),
+        }
+        if self._last_distance_to_route_m is not None:
+            payload["meters_from_route"] = round(self._last_distance_to_route_m, 1)
+        return payload
+
     async def _emit(self, guide: TurnGuide, cue: str) -> None:
         if self._idle is not None:
             await self._idle.wait()
@@ -342,7 +458,10 @@ class NavigationController:
                 await asyncio.sleep(TICK_SECONDS)
                 if self._guide is not guide:
                     return
-                for cue in guide.advance(WALK_METERS_PER_SECOND * TICK_SECONDS):
+                delta = WALK_METERS_PER_SECOND * TICK_SECONDS
+                self._last_along_m += delta
+                self._last_on_route = True
+                for cue in guide.advance(delta):
                     await self._emit(guide, cue)
                     if self._guide is not guide:
                         return
@@ -353,6 +472,11 @@ class NavigationController:
 
     async def _follow_gps(self, guide: TurnGuide, geometry: RouteGeometry) -> None:
         last_along = 0.0
+        off_route_since: float | None = None
+        gps_lost_since: float | None = None
+        gps_lost_announced = False
+        corner_grace_until = 0.0
+        last_step_index = guide._index
         try:
             if GPS_START_GRACE_SECONDS > 0:
                 await asyncio.sleep(GPS_START_GRACE_SECONDS)
@@ -366,17 +490,60 @@ class NavigationController:
                 try:
                     fix = await self._location.current_fix()
                 except Exception:
+                    now = time.monotonic()
+                    if gps_lost_since is None:
+                        gps_lost_since = now
+                    elif (
+                        not gps_lost_announced
+                        and now - gps_lost_since >= GPS_LOST_BEFORE_SPEAK_SECONDS
+                    ):
+                        await self._emit(guide, GPS_LOST_CUE)
+                        gps_lost_announced = True
                     continue
-                cues = self._progress_from_fix(guide, geometry, fix, last_along)
+
+                if gps_lost_announced:
+                    await self._emit(guide, GPS_BACK_CUE)
+                    gps_lost_announced = False
+                gps_lost_since = None
+
+                if guide._index != last_step_index:
+                    last_step_index = guide._index
+                    corner_grace_until = time.monotonic() + CORNER_GRACE_SECONDS
+
+                threshold = (
+                    CORNER_OFF_ROUTE_METERS
+                    if time.monotonic() < corner_grace_until
+                    else OFF_ROUTE_METERS
+                )
+                cues = self._progress_from_fix(
+                    guide,
+                    geometry,
+                    fix,
+                    last_along,
+                    off_route_meters=threshold,
+                )
                 if cues is None:
-                    await self._emit(guide, OFF_ROUTE_CUE)
-                    self.cancel()
-                    return
+                    self._last_on_route = False
+                    now = time.monotonic()
+                    if off_route_since is None:
+                        off_route_since = now
+                    if now - off_route_since >= OFF_ROUTE_HOLD_SECONDS:
+                        await self._emit(guide, OFF_ROUTE_CUE)
+                        self.cancel()
+                        return
+                    continue
+
+                off_route_since = None
+                self._last_on_route = True
                 last_along, due = cues
+                self._last_along_m = last_along
                 for cue in due:
                     await self._emit(guide, cue)
                     if self._guide is not guide:
                         return
+                    if guide._index != last_step_index:
+                        last_step_index = guide._index
+                        corner_grace_until = time.monotonic() + CORNER_GRACE_SECONDS
         except asyncio.CancelledError:
             return
         except Exception as error:
@@ -388,15 +555,18 @@ class NavigationController:
         geometry: RouteGeometry,
         fix: LocationFix,
         last_along: float,
+        *,
+        off_route_meters: float = OFF_ROUTE_METERS,
     ) -> tuple[float, list[str]] | None:
-        """Advance from one fix. None means off-route (caller should stop)."""
+        """Advance from one fix. None means off-route (caller may stop after hold)."""
         along, distance = geometry.project(fix.latitude, fix.longitude)
+        self._last_distance_to_route_m = distance
         end_lat, end_lon = geometry.endpoint
         near_end = (
             haversine_meters(fix.latitude, fix.longitude, end_lat, end_lon)
             <= ARRIVAL_METERS
         )
-        if distance > OFF_ROUTE_METERS and not near_end:
+        if distance > off_route_meters and not near_end:
             return None
 
         cues: list[str] = []

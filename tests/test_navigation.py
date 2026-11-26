@@ -12,6 +12,8 @@ from location import navigation
 from location.navigation import (
     APPROACH_MIN_STEP_METERS,
     FIVE_FEET_METERS,
+    GPS_BACK_CUE,
+    GPS_LOST_CUE,
     OFF_ROUTE_CUE,
     NavigationController,
     RouteGeometry,
@@ -67,6 +69,28 @@ class TurnGuideTests(unittest.TestCase):
         cues = guide.advance(APPROACH_MIN_STEP_METERS)
         self.assertNotIn("In 5 feet, turn left", cues)
         self.assertIn("Turn left", cues)
+
+    def test_previews_next_turn_after_a_turn(self) -> None:
+        guide = TurnGuide(
+            [
+                ("Head north", 10),
+                ("Turn left onto Eastgate", 40),
+                ("Turn right onto Main", 20),
+            ]
+        )
+        guide.start_cues()
+        cues = guide.advance(10)
+        self.assertIn("Turn left onto Eastgate", cues)
+        self.assertNotIn("Next:", "".join(cues))
+        cues = guide.advance(10)
+        self.assertEqual(cues, ["Next: turn right onto Main"])
+        self.assertEqual(guide.advance(5), [])
+
+    def test_previews_arrival_after_last_turn(self) -> None:
+        guide = TurnGuide([("Head north", 10), ("Turn left onto Eastgate", 40)])
+        guide.start_cues()
+        guide.advance(10)
+        self.assertEqual(guide.advance(10), ["Next: you will arrive"])
 
     def test_payload_hides_the_rest_of_the_route(self) -> None:
         payload = navigation_payload(
@@ -139,9 +163,11 @@ class NavigationSessionTests(unittest.IsolatedAsyncioTestCase):
         class Navigator:
             def __init__(self) -> None:
                 self.steps = None
+                self.destination = None
 
-            def start(self, steps) -> str:
+            def start(self, steps, *, destination: str = "") -> str:
                 self.steps = steps
+                self.destination = destination
                 return steps[0]["instruction"]
 
         google_module = types.ModuleType("google")
@@ -201,6 +227,66 @@ class NavigationSessionTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("steps", response)
         self.assertEqual(navigator.steps[0]["instruction"], "Head north")
         self.assertEqual(navigator.steps[0]["distance_meters"], 200)
+        self.assertEqual(navigator.destination, "the pharmacy")
+
+    async def test_navigation_status_tool_reports_active_route(self) -> None:
+        class FakeFunctionResponse:
+            def __init__(self, *, id, name, response) -> None:
+                self.id = id
+                self.name = name
+                self.response = response
+
+        class Session:
+            def __init__(self) -> None:
+                self.responses = []
+
+            async def send_tool_response(self, function_responses) -> None:
+                self.responses.extend(function_responses)
+
+        class Location:
+            async def current_fix(self) -> LocationFix:
+                return LocationFix(37.7, -122.4, 8, timestamp=1)
+
+        class Navigator:
+            def status(self) -> dict:
+                return {
+                    "status": "ok",
+                    "active": True,
+                    "navigation": "on",
+                    "destination": "Masjid Haq",
+                    "on_route": True,
+                    "current_instruction": "Head south on S Stewart Ave",
+                    "next_instruction": "Turn right onto Eastgate Rd",
+                    "message": "ok",
+                }
+
+        google_module = types.ModuleType("google")
+        google_module.__path__ = []
+        genai_module = types.ModuleType("google.genai")
+        genai_module.types = SimpleNamespace(FunctionResponse=FakeFunctionResponse)
+        session = Session()
+        tool_call = SimpleNamespace(
+            function_calls=[
+                SimpleNamespace(
+                    id="nav-1",
+                    name="get_navigation_status",
+                    args={},
+                )
+            ]
+        )
+
+        with patch.dict(
+            sys.modules,
+            {"google": google_module, "google.genai": genai_module},
+        ):
+            await handle_location_tool_call(
+                tool_call, session, Location(), "maps-key", Navigator()
+            )
+
+        response = session.responses[0].response
+        self.assertTrue(response["active"])
+        self.assertEqual(response["destination"], "Masjid Haq")
+        self.assertTrue(response["on_route"])
 
 
 class RouteGeometryTests(unittest.TestCase):
@@ -356,6 +442,7 @@ class GpsNavigationTests(unittest.IsolatedAsyncioTestCase):
         with (
             patch.object(navigation, "TICK_SECONDS", 0.01),
             patch.object(navigation, "GPS_START_GRACE_SECONDS", 0),
+            patch.object(navigation, "OFF_ROUTE_HOLD_SECONDS", 0),
             patch.object(
                 navigation.RouteGeometry, "from_route_steps", fake_from_steps
             ),
@@ -368,6 +455,114 @@ class GpsNavigationTests(unittest.IsolatedAsyncioTestCase):
             controller.cancel()
 
         self.assertEqual(spoken.count(OFF_ROUTE_CUE), 1)
+
+    async def test_brief_off_route_blip_does_not_cancel(self) -> None:
+        spoken = []
+
+        async def speak(phrase: str) -> None:
+            spoken.append(phrase)
+
+        class BlipLocation:
+            def __init__(self) -> None:
+                self.n = 0
+
+            async def current_fix(self) -> LocationFix:
+                self.n += 1
+                # One far fix, then back on the polyline.
+                if self.n == 2:
+                    return LocationFix(37.1, -122.0, 5, timestamp=self.n)
+                return LocationFix(37.00005, -122.0, 5, timestamp=self.n)
+
+            async def close(self) -> None:
+                return None
+
+        steps = [
+            {
+                "instruction": "Head north",
+                "distance_meters": 50,
+                "encoded_polyline": "",
+            }
+        ]
+        controller = NavigationController(
+            speak, location=BlipLocation(), use_gps=True
+        )
+
+        def fake_from_steps(_steps):
+            return RouteGeometry([(37.0, -122.0), (37.001, -122.0)])
+
+        with (
+            patch.object(navigation, "TICK_SECONDS", 0.01),
+            patch.object(navigation, "GPS_START_GRACE_SECONDS", 0),
+            patch.object(navigation, "OFF_ROUTE_HOLD_SECONDS", 1.0),
+            patch.object(
+                navigation.RouteGeometry, "from_route_steps", fake_from_steps
+            ),
+        ):
+            controller.start(steps, destination="the park")
+            await asyncio.sleep(0.12)
+            status = controller.status()
+            controller.cancel()
+
+        self.assertNotIn(OFF_ROUTE_CUE, spoken)
+        self.assertTrue(status["active"])
+        self.assertEqual(status["destination"], "the park")
+
+    async def test_gps_loss_announces_then_recovery(self) -> None:
+        spoken = []
+
+        async def speak(phrase: str) -> None:
+            spoken.append(phrase)
+
+        class FlakyLocation:
+            def __init__(self) -> None:
+                self.n = 0
+
+            async def current_fix(self) -> LocationFix:
+                self.n += 1
+                if self.n <= 8:
+                    raise RuntimeError("Waiting for a GPS fix.")
+                return LocationFix(37.00005, -122.0, 5, timestamp=self.n)
+
+            async def close(self) -> None:
+                return None
+
+        steps = [
+            {
+                "instruction": "Head north",
+                "distance_meters": 50,
+                "encoded_polyline": "",
+            }
+        ]
+        controller = NavigationController(
+            speak, location=FlakyLocation(), use_gps=True
+        )
+
+        def fake_from_steps(_steps):
+            return RouteGeometry([(37.0, -122.0), (37.001, -122.0)])
+
+        with (
+            patch.object(navigation, "TICK_SECONDS", 0.01),
+            patch.object(navigation, "GPS_START_GRACE_SECONDS", 0),
+            patch.object(navigation, "GPS_LOST_BEFORE_SPEAK_SECONDS", 0.05),
+            patch.object(
+                navigation.RouteGeometry, "from_route_steps", fake_from_steps
+            ),
+        ):
+            controller.start(steps)
+            for _ in range(80):
+                if GPS_BACK_CUE in spoken:
+                    break
+                await asyncio.sleep(0.01)
+            controller.cancel()
+
+        self.assertIn(GPS_LOST_CUE, spoken)
+        self.assertIn(GPS_BACK_CUE, spoken)
+
+    def test_status_reports_inactive_when_idle(self) -> None:
+        controller = NavigationController(lambda _phrase: None)
+        status = controller.status()
+        self.assertFalse(status["active"])
+        self.assertEqual(status["navigation"], "off")
 
 
 if __name__ == "__main__":

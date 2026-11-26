@@ -20,7 +20,10 @@ logger = logging.getLogger(__name__)
 LOCATION_TOOL = "get_current_location"
 DIRECTIONS_TOOL = "get_directions"
 NEARBY_TOOL = "find_nearby_place"
-LOCATION_TOOL_NAMES = frozenset({LOCATION_TOOL, DIRECTIONS_TOOL, NEARBY_TOOL})
+NAV_STATUS_TOOL = "get_navigation_status"
+LOCATION_TOOL_NAMES = frozenset(
+    {LOCATION_TOOL, DIRECTIONS_TOOL, NEARBY_TOOL, NAV_STATUS_TOOL}
+)
 
 LOCATION_INSTRUCTION = """
 
@@ -41,6 +44,10 @@ directions to it (for example "nearest gas station"), call \
 find_nearby_place with the kind of place, such as "gas station". Speak \
 only say_now (it already names the place and confirms the destination). \
 Do not read the rest of the route. Do not invent a place.
+- If the user asks whether navigation is on, whether they are going the \
+right way, if they are on the route, what the next turn is, or similar \
+status questions, call get_navigation_status. Answer only from that \
+result in short English. Do not guess.
 - A message that starts with "[Navigation cue:" is the next GPS prompt. \
 Speak only the sentence after the colon, in English exactly as written, \
 then stop. Do not add any other step, translate it, or summarize the route.
@@ -108,6 +115,17 @@ def build_location_tools(types: Any) -> Any:
                     required=["query"],
                 ),
             ),
+            types.FunctionDeclaration(
+                name=NAV_STATUS_TOOL,
+                description=(
+                    "Check whether turn-by-turn navigation is running, "
+                    "whether the user is on the route, the destination, "
+                    "and the current or next instruction. Call this when "
+                    "the user asks if navigation is on, if they are going "
+                    "the right way, if they are on the route, or what the "
+                    "next turn is. Answer only from the tool result."
+                ),
+            ),
         ]
     )
 
@@ -137,6 +155,7 @@ async def run_location_tool(
     maps_api_key: str,
     *,
     fetch: Any = None,
+    navigator: Any = None,
 ) -> dict[str, Any]:
     """Run one location tool. A missing fix never calls Google Maps."""
     if name == LOCATION_TOOL:
@@ -144,6 +163,19 @@ async def run_location_tool(
         if isinstance(fix, dict):
             return fix
         return fix_payload(fix)
+
+    if name == NAV_STATUS_TOOL:
+        if navigator is None:
+            return {
+                "status": "ok",
+                "active": False,
+                "navigation": "off",
+                "message": (
+                    "Navigation is not running. Say that clearly in English. "
+                    "Do not invent a route status."
+                ),
+            }
+        return navigator.status()
 
     if name == DIRECTIONS_TOOL:
         fix = await _read_fix(location)
@@ -229,6 +261,7 @@ async def handle_location_tool_call(
                 dict(call.args or {}),
                 location,
                 maps_api_key,
+                navigator=navigator,
             )
         except Exception as error:
             logger.warning("Location tool %s failed: %s", call.name, error)
@@ -242,8 +275,11 @@ async def handle_location_tool_call(
             and isinstance(result, dict)
             and result.get("status") == "ok"
             and steps
+            and call.name in {DIRECTIONS_TOOL, NEARBY_TOOL}
         ):
-            say_now = navigator.start(steps)
+            say_now = navigator.start(
+                steps, destination=destination_label(result)
+            )
             result = navigation_payload(result, say_now)
         status = result.get("status")
         if status == "error":
