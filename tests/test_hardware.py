@@ -31,6 +31,9 @@ class HardwareDriverTests(unittest.IsolatedAsyncioTestCase):
             mode=DeploymentMode.HARDWARE,
             gemini_api_key="test-key",
             gemini_live_model="test-model",
+            google_maps_api_key="maps-key",
+            gps_serial_port="/dev/gps-test",
+            gps_baud_rate=9600,
         )
 
         with patch.dict(sys.modules, {"gpiozero": gpiozero}):
@@ -39,6 +42,9 @@ class HardwareDriverTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsInstance(peripherals.audio_input, hardware.PiAudioInput)
         self.assertIsInstance(peripherals.audio_output, hardware.PiAudioOutput)
         self.assertIsInstance(peripherals.camera, hardware.PiCamera)
+        self.assertIsInstance(peripherals.location, hardware.NeoM8NLocation)
+        self.assertEqual(peripherals.location._port, "/dev/gps-test")
+        self.assertEqual(peripherals.location._baud_rate, 9600)
         self.assertEqual(
             [device.pin for device in created_buttons],
             [
@@ -52,6 +58,11 @@ class HardwareDriverTests(unittest.IsolatedAsyncioTestCase):
             [device.pull_up for device in created_buttons],
             [True, True, True, True],
         )
+        peripherals.location.apply_nmea_for_tests(
+            "$GPGGA,123519,4807.038,N,01131.000,E,1,08,0.9,545.4,M,46.9,M,,*47"
+        )
+        fix = await peripherals.location.current_fix()
+        self.assertAlmostEqual(fix.latitude, 48.1173, places=4)
         await peripherals.close()
 
     async def test_gpio_button_publishes_async_press_and_release_events(self) -> None:
@@ -89,18 +100,23 @@ class HardwareDriverTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(released, ButtonEvent(pressed=False, timestamp=released.timestamp))
         self.assertGreaterEqual(released.timestamp, pressed.timestamp)
 
-    async def test_pi_audio_input_preserves_queued_pcm_when_stopped(self) -> None:
+    async def test_pi_audio_input_opens_at_device_rate_and_downsamples(self) -> None:
+        import array
+
         class FakeInputStream:
             active = False
 
             def __init__(self, **kwargs):
+                self.kwargs = kwargs
                 self.callback = kwargs["callback"]
 
             def start(self) -> None:
                 self.active = True
 
             def stop(self) -> None:
-                self.callback(b"\x01\x02", 1, None, None)
+                # Three stereo frames at 48 kHz → one 16 kHz mono sample after /3.
+                samples = array.array("h", [100, 100, 100, 100, 100, 100])
+                self.callback(samples.tobytes(), 3, None, None)
                 self.active = False
 
             def close(self) -> None:
@@ -112,13 +128,18 @@ class HardwareDriverTests(unittest.IsolatedAsyncioTestCase):
         with patch.dict(sys.modules, {"sounddevice": sounddevice}):
             audio_input = hardware.PiAudioInput()
             await audio_input.start_capture()
+            stream = audio_input._stream
             await audio_input.stop_capture()
             frames = [frame async for frame in audio_input.frames()]
             await audio_input.close()
 
-        self.assertEqual(frames, [AudioInputFrame(pcm=b"\x01\x02")])
+        self.assertEqual(stream.kwargs["samplerate"], hardware.DEVICE_SAMPLE_RATE_HZ)
+        self.assertEqual(stream.kwargs["channels"], hardware.DEVICE_CHANNELS)
+        self.assertEqual(frames, [AudioInputFrame(pcm=array.array("h", [100]).tobytes())])
 
-    async def test_pi_audio_output_uses_24khz_and_interrupts_stream(self) -> None:
+    async def test_pi_audio_output_upsamples_to_device_rate_and_interrupts(self) -> None:
+        import array
+
         streams = []
 
         class FakeOutputStream:
@@ -150,15 +171,44 @@ class HardwareDriverTests(unittest.IsolatedAsyncioTestCase):
 
         with patch.dict(sys.modules, {"sounddevice": sounddevice}):
             audio_output = hardware.PiAudioOutput()
-            await audio_output.play(AudioOutputFrame(pcm=b"\x03\x04"))
+            # Full volume so scale_pcm is a no-op; assert resample path alone.
+            from interfaces import VOLUME_MAX
+
+            audio_output.adjust_volume(VOLUME_MAX - audio_output.get_volume())
+            # One 24 kHz mono sample → two 48 kHz mono → stereo L/R pair twice.
+            await audio_output.play(AudioOutputFrame(pcm=array.array("h", [7]).tobytes()))
             await audio_output.interrupt()
 
-        self.assertEqual(streams[0].kwargs["samplerate"], 24_000)
-        self.assertEqual(streams[0].kwargs["channels"], 1)
+        self.assertEqual(streams[0].kwargs["samplerate"], hardware.DEVICE_SAMPLE_RATE_HZ)
+        self.assertEqual(streams[0].kwargs["channels"], hardware.DEVICE_CHANNELS)
         self.assertEqual(streams[0].kwargs["device"], None)
-        self.assertEqual(streams[0].frames, [b"\x03\x04"])
+        self.assertEqual(
+            streams[0].frames,
+            [array.array("h", [7, 7, 7, 7]).tobytes()],
+        )
         self.assertTrue(streams[0].stopped)
         self.assertTrue(streams[0].closed)
+
+    def test_audio_resample_helpers(self) -> None:
+        import array
+
+        stereo = array.array("h", [10, 30, 20, 40]).tobytes()
+        self.assertEqual(
+            hardware._stereo_i16_to_mono(stereo),
+            array.array("h", [20, 30]).tobytes(),
+        )
+        pending = bytearray()
+        down = hardware._downsample_i16_mono(
+            array.array("h", [1, 2, 3, 4, 5]).tobytes(), 3, pending
+        )
+        self.assertEqual(down, array.array("h", [1]).tobytes())
+        self.assertEqual(bytes(pending), array.array("h", [4, 5]).tobytes())
+        up = hardware._upsample_i16_mono(array.array("h", [9]).tobytes(), 2)
+        self.assertEqual(up, array.array("h", [9, 9]).tobytes())
+        self.assertEqual(
+            hardware._mono_i16_to_stereo(array.array("h", [5]).tobytes()),
+            array.array("h", [5, 5]).tobytes(),
+        )
 
     async def test_hardware_module_import_does_not_require_opencv(self) -> None:
         """Importing/creating peripherals must not load OpenCV (Pi BLAS issue)."""
@@ -190,6 +240,9 @@ class HardwareDriverTests(unittest.IsolatedAsyncioTestCase):
             mode=DeploymentMode.HARDWARE,
             gemini_api_key="test-key",
             gemini_live_model="test-model",
+            google_maps_api_key="maps-key",
+            gps_serial_port="/dev/gps-test",
+            gps_baud_rate=9600,
         )
 
         with patch.dict(sys.modules, {"gpiozero": gpiozero, "cv2": None}):
@@ -197,6 +250,7 @@ class HardwareDriverTests(unittest.IsolatedAsyncioTestCase):
                 reloaded = importlib.reload(hardware)
                 peripherals = reloaded.create_peripherals(settings)
                 self.assertIsInstance(peripherals.camera, reloaded.PiCamera)
+                self.assertIsInstance(peripherals.location, reloaded.NeoM8NLocation)
                 await peripherals.close()
 
         # Restore the module under its normal import path for later tests.
@@ -209,16 +263,33 @@ class HardwareDriverTests(unittest.IsolatedAsyncioTestCase):
                 self.closed = False
                 self.config = None
                 self.capture_file_calls = 0
+                self.controls = []
+                self.sensor_resolution = (3280, 2464)
+                self.camera_controls = {}
+                self.camera_properties = {
+                    "ScalerCropMaximum": (0, 0, 3280, 2464),
+                    "PixelArraySize": (3280, 2464),
+                }
+                self._crop = (0, 280, 3280, 1845)
 
-            def create_preview_configuration(self, main):
+            def create_preview_configuration(self, main, sensor=None):
                 self.config = main
-                return {"main": main}
+                self.sensor = sensor
+                return {"main": main, "sensor": sensor}
 
             def configure(self, config) -> None:
                 self.applied = config
 
             def start(self) -> None:
                 self.started = True
+
+            def set_controls(self, controls) -> None:
+                self.controls.append(controls)
+                if "ScalerCrop" in controls:
+                    self._crop = controls["ScalerCrop"]
+
+            def capture_metadata(self):
+                return {"ScalerCrop": self._crop}
 
             def capture_file(self, file_output, format=None) -> None:
                 self.capture_file_calls += 1
@@ -240,18 +311,31 @@ class HardwareDriverTests(unittest.IsolatedAsyncioTestCase):
         picamera2.Picamera2 = FakePicamera2
 
         with patch.dict(sys.modules, {"picamera2": picamera2, "cv2": None}):
-            camera = hardware.PiCamera()
-            await camera.start_capture()
-            fake = camera._camera
-            frames = camera.frames()
-            frame = await asyncio.wait_for(anext(frames), timeout=2)
-            await camera.stop_capture()
-            await frames.aclose()
-            await camera.close()
+            with patch.object(hardware, "CAMERA_WARM_UP_S", 0):
+                camera = hardware.PiCamera()
+                self.assertFalse(camera.is_on)
+                await camera.start_capture()
+                self.assertTrue(camera.is_on)
+                fake = camera._camera
+                frames = camera.frames()
+                frame = await asyncio.wait_for(anext(frames), timeout=2)
+                fresh = await camera._fresh_frame()
+                zoom = await camera.zoom_to(2.0, 0.5, 0.5)
+                focus = await camera.retry_autofocus()
+                await camera.stop_capture()
+                self.assertFalse(camera.is_on)
+                await frames.aclose()
+                await camera.close()
 
-        self.assertEqual(fake.capture_file_calls, 1)
+        self.assertGreaterEqual(fake.capture_file_calls, 3)
         self.assertEqual(fake.assert_format, "jpeg")
         self.assertEqual(frame.jpeg, b"\xff\xd8picamera-jpeg\xff\xd9")
+        self.assertEqual(fresh.jpeg, b"\xff\xd8picamera-jpeg\xff\xd9")
+        self.assertEqual(zoom["status"], "ok")
+        self.assertEqual(zoom["zoom_level"], 2.0)
+        self.assertIn("ScalerCrop", fake.controls[0])
+        self.assertEqual(focus["status"], "not_supported")
+        self.assertIsNotNone(zoom.get("frame"))
 
     async def test_pi_camera_falls_back_to_pillow_when_capture_file_unavailable(
         self,
@@ -269,9 +353,15 @@ class HardwareDriverTests(unittest.IsolatedAsyncioTestCase):
             def __init__(self) -> None:
                 self.started = False
                 self.closed = False
+                self.sensor_resolution = (3280, 2464)
+                self.camera_controls = {}
+                self.camera_properties = {
+                    "ScalerCropMaximum": (0, 0, 3280, 2464),
+                    "PixelArraySize": (3280, 2464),
+                }
 
-            def create_preview_configuration(self, main):
-                return {"main": main}
+            def create_preview_configuration(self, main, sensor=None):
+                return {"main": main, "sensor": sensor}
 
             def configure(self, config) -> None:
                 pass
@@ -279,11 +369,17 @@ class HardwareDriverTests(unittest.IsolatedAsyncioTestCase):
             def start(self) -> None:
                 self.started = True
 
+            def set_controls(self, controls) -> None:
+                pass
+
             def capture_file(self, file_output, format=None) -> None:
                 raise RuntimeError("JPEG still capture not configured")
 
             def capture_array(self):
-                return [[[0, 0, 0]]]
+                # Minimal ndarray-like object: supports the BGR↔RGB flip.
+                import numpy as np
+
+                return np.zeros((2, 2, 3), dtype=np.uint8)
 
             def stop(self) -> None:
                 self.started = False
@@ -307,12 +403,13 @@ class HardwareDriverTests(unittest.IsolatedAsyncioTestCase):
                 "cv2": None,
             },
         ):
-            camera = hardware.PiCamera()
-            await camera.start_capture()
-            frames = camera.frames()
-            frame = await asyncio.wait_for(anext(frames), timeout=2)
-            await camera.stop_capture()
-            await frames.aclose()
-            await camera.close()
+            with patch.object(hardware, "CAMERA_WARM_UP_S", 0):
+                camera = hardware.PiCamera()
+                await camera.start_capture()
+                frames = camera.frames()
+                frame = await asyncio.wait_for(anext(frames), timeout=2)
+                await camera.stop_capture()
+                await frames.aclose()
+                await camera.close()
 
         self.assertEqual(frame.jpeg, b"\xff\xd8pillow-jpeg\xff\xd9")

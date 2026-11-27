@@ -1,27 +1,33 @@
 """Raspberry Pi 5 peripheral drivers for hardware deployment mode.
 
 Provisional assumptions (not confirmed final wiring or ALSA device names):
-- Audio capture/playback use PortAudio/ALSA defaults (`device=None`).
+- Audio: Google Voice HAT (and similar) run at 48 kHz stereo. Capture is
+  mixed to mono and downsampled to 16 kHz for Gemini; playback is upsampled
+  from 24 kHz mono to 48 kHz stereo. PortAudio uses ALSA defaults (`device=None`).
 - Talk button: BCM GPIO17; camera button: BCM GPIO27.
 - Volume up: BCM GPIO23; volume down: BCM GPIO24.
 - Buttons are active-low with internal pull-ups and 50 ms debounce.
 - Picamera2 is installed via apt (`python3-picamera2`), not requirements.txt.
 - Camera works with Camera Module 2 (fixed focus) and Module 3 (autofocus).
+- GPS: u-blox NEO-M8N on UART (/dev/serial0, 9600 baud) via NeoM8NLocation.
 """
 
 from __future__ import annotations
 
+import array
 import asyncio
 import io
 import logging
 import threading
 import time
-from typing import Optional
+from collections.abc import Callable
+from typing import Any, Optional
 
 from config import Settings
 from interfaces import (
     AUDIO_INPUT_SAMPLE_RATE_HZ,
     AUDIO_OUTPUT_SAMPLE_RATE_HZ,
+    AUDIO_SAMPLE_WIDTH_BYTES,
     VIDEO_FRAME_HEIGHT,
     VIDEO_FRAME_WIDTH,
     VIDEO_FRAMES_PER_SECOND,
@@ -33,8 +39,11 @@ from interfaces import (
     ButtonEvent,
     Camera,
     CompanionPeripherals,
+    Location,
+    LocationFix,
     VideoFrame,
 )
+from location.nmea import parse_nmea_line
 from peripherals.volume import VolumeController
 
 logger = logging.getLogger(__name__)
@@ -45,18 +54,86 @@ CAMERA_BUTTON_GPIO = 27
 VOLUME_UP_BUTTON_GPIO = 23
 VOLUME_DOWN_BUTTON_GPIO = 24
 BUTTON_BOUNCE_TIME_S = 0.05
+GPS_STALE_AFTER_SECONDS = 15.0
+GPS_FIX_WAIT_SECONDS = 2.5
+# Google Voice HAT / similar I2S cards: native rate and channel count.
+DEVICE_SAMPLE_RATE_HZ = 48_000
+DEVICE_CHANNELS = 2
+_INPUT_DOWNSAMPLE = DEVICE_SAMPLE_RATE_HZ // AUDIO_INPUT_SAMPLE_RATE_HZ  # 3
+_OUTPUT_UPSAMPLE = DEVICE_SAMPLE_RATE_HZ // AUDIO_OUTPUT_SAMPLE_RATE_HZ  # 2
+SerialFactory = Callable[[str, int], Any]
+
+
+def _stereo_i16_to_mono(pcm: bytes) -> bytes:
+    """Average L/R int16 samples into mono int16 PCM."""
+    if len(pcm) < 4:
+        return b""
+    samples = array.array("h")
+    samples.frombytes(pcm[: len(pcm) - (len(pcm) % 4)])
+    mono = array.array("h")
+    for index in range(0, len(samples) - 1, 2):
+        mono.append((samples[index] + samples[index + 1]) // 2)
+    return mono.tobytes()
+
+
+def _downsample_i16_mono(pcm: bytes, factor: int, pending: bytearray) -> bytes:
+    """Keep every Nth mono int16 sample; retain incomplete groups in pending."""
+    if factor <= 1:
+        return pcm
+    pending.extend(pcm)
+    usable_bytes = len(pending) - (len(pending) % AUDIO_SAMPLE_WIDTH_BYTES)
+    if usable_bytes <= 0:
+        return b""
+    samples = array.array("h")
+    samples.frombytes(bytes(pending[:usable_bytes]))
+    del pending[:usable_bytes]
+    complete = len(samples) - (len(samples) % factor)
+    if complete <= 0:
+        pending.extend(samples.tobytes())
+        return b""
+    down = array.array("h", samples[:complete:factor])
+    if complete < len(samples):
+        pending.extend(samples[complete:].tobytes())
+    return down.tobytes()
+
+
+def _upsample_i16_mono(pcm: bytes, factor: int) -> bytes:
+    """Repeat each mono int16 sample `factor` times."""
+    if factor <= 1 or not pcm:
+        return pcm
+    samples = array.array("h")
+    samples.frombytes(pcm[: len(pcm) - (len(pcm) % AUDIO_SAMPLE_WIDTH_BYTES)])
+    up = array.array("h")
+    for sample in samples:
+        for _ in range(factor):
+            up.append(sample)
+    return up.tobytes()
+
+
+def _mono_i16_to_stereo(pcm: bytes) -> bytes:
+    """Duplicate each mono int16 sample into L and R."""
+    if not pcm:
+        return b""
+    samples = array.array("h")
+    samples.frombytes(pcm[: len(pcm) - (len(pcm) % AUDIO_SAMPLE_WIDTH_BYTES)])
+    stereo = array.array("h")
+    for sample in samples:
+        stereo.append(sample)
+        stereo.append(sample)
+    return stereo.tobytes()
 
 
 class PiAudioInput:
-    """Wired microphone / ALSA-default capture producing 16 kHz mono PCM."""
+    """Voice HAT capture at 48 kHz stereo, delivered as 16 kHz mono PCM."""
 
     def __init__(self) -> None:
         self._queue: asyncio.Queue[Optional[bytes]] = asyncio.Queue()
         self._stream = None
         self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self._pending = bytearray()
 
     async def start_capture(self) -> None:
-        """Start capturing audio from the ALSA-default input device."""
+        """Start capturing from the ALSA-default Voice HAT input device."""
         import sounddevice as sd
 
         if self._stream is not None and self._stream.active:
@@ -64,16 +141,17 @@ class PiAudioInput:
 
         while not self._queue.empty():
             self._queue.get_nowait()
+        self._pending.clear()
 
         self._loop = asyncio.get_running_loop()
 
         if self._stream is None:
-            # device=None: provisional ALSA/PortAudio default capture.
+            # Native Voice HAT rate; resample to AUDIO_INPUT_SAMPLE_RATE_HZ in callback.
             self._stream = sd.RawInputStream(
-                samplerate=AUDIO_INPUT_SAMPLE_RATE_HZ,
-                channels=1,
+                samplerate=DEVICE_SAMPLE_RATE_HZ,
+                channels=DEVICE_CHANNELS,
                 dtype="int16",
-                blocksize=1600,
+                blocksize=DEVICE_SAMPLE_RATE_HZ // 10,  # ~100 ms
                 device=None,
                 callback=self._audio_callback,
             )
@@ -81,11 +159,11 @@ class PiAudioInput:
         self._stream.start()
 
     def _audio_callback(self, indata, frames, time_info, status) -> None:
-        if self._loop is not None:
-            self._loop.call_soon_threadsafe(
-                self._queue.put_nowait,
-                bytes(indata),
-            )
+        mono = _stereo_i16_to_mono(bytes(indata))
+        pcm16 = _downsample_i16_mono(mono, _INPUT_DOWNSAMPLE, self._pending)
+        if not pcm16 or self._loop is None:
+            return
+        self._loop.call_soon_threadsafe(self._queue.put_nowait, pcm16)
 
     async def frames(self):
         """Yield one capture's queued microphone frames until the stop sentinel."""
@@ -110,10 +188,11 @@ class PiAudioInput:
                 self._stream.stop()
             self._stream.close()
             self._stream = None
+        self._pending.clear()
 
 
 class PiAudioOutput:
-    """MAX98357A / ALSA-default speaker accepting 24 kHz mono PCM."""
+    """Voice HAT playback: accepts 24 kHz mono, plays as 48 kHz stereo."""
 
     def __init__(self) -> None:
         self._stream = None
@@ -128,20 +207,22 @@ class PiAudioOutput:
         return self._volume.adjust_volume(steps)
 
     async def play(self, frame: AudioOutputFrame) -> None:
-        """Play one audio frame through the ALSA-default output device."""
+        """Play one Gemini audio frame through the ALSA-default output device."""
         import sounddevice as sd
 
         generation = self._generation
-        pcm = self._volume.scale_pcm(frame.pcm)
+        scaled = self._volume.scale_pcm(frame.pcm)
+        device_pcm = _mono_i16_to_stereo(
+            _upsample_i16_mono(scaled, _OUTPUT_UPSAMPLE)
+        )
         async with self._lock:
             if generation != self._generation:
                 return
 
             if self._stream is None:
-                # device=None: provisional ALSA/PortAudio default playback.
                 self._stream = sd.RawOutputStream(
-                    samplerate=AUDIO_OUTPUT_SAMPLE_RATE_HZ,
-                    channels=1,
+                    samplerate=DEVICE_SAMPLE_RATE_HZ,
+                    channels=DEVICE_CHANNELS,
                     dtype="int16",
                     device=None,
                 )
@@ -149,7 +230,7 @@ class PiAudioOutput:
 
             stream = self._stream
             try:
-                await asyncio.to_thread(stream.write, pcm)
+                await asyncio.to_thread(stream.write, device_pcm)
             except sd.PortAudioError:
                 if generation != self._generation:
                     return
@@ -686,34 +767,195 @@ class PiButton:
             self._device = None
 
 
+def _open_serial_port(port: str, baud_rate: int) -> Any:
+    """Open a UART port for NMEA. Imported lazily so laptop tests need no pyserial."""
+    import serial
+
+    return serial.Serial(port=port, baudrate=baud_rate, timeout=1.0)
+
+
+class NeoM8NLocation:
+    """u-blox NEO-M8N UART GPS: background NMEA reader, latest valid fix."""
+
+    def __init__(
+        self,
+        port: str,
+        baud_rate: int,
+        *,
+        serial_factory: SerialFactory | None = None,
+        stale_after_seconds: float = GPS_STALE_AFTER_SECONDS,
+        fix_wait_seconds: float = GPS_FIX_WAIT_SECONDS,
+    ) -> None:
+        if not port:
+            raise ValueError("GPS serial port must not be empty.")
+        if baud_rate <= 0:
+            raise ValueError("GPS baud rate must be greater than zero.")
+        self._port = port
+        self._baud_rate = baud_rate
+        self._serial_factory = serial_factory or _open_serial_port
+        self._stale_after_seconds = stale_after_seconds
+        self._fix_wait_seconds = max(0.0, float(fix_wait_seconds))
+        self._lock = threading.Lock()
+        self._fix: LocationFix | None = None
+        self._error: str | None = None
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._serial: Any = None
+        self._started = False
+
+    def start(self) -> None:
+        """Open the UART and begin reading NMEA in a background thread."""
+        if self._started:
+            return
+        self._stop.clear()
+        self._thread = threading.Thread(
+            target=self._read_loop,
+            name="neo-m8n-gps",
+            daemon=True,
+        )
+        self._thread.start()
+        self._started = True
+
+    def _close_serial(self) -> None:
+        serial_port = self._serial
+        self._serial = None
+        if serial_port is not None:
+            try:
+                serial_port.close()
+            except Exception:
+                pass
+
+    def _read_loop(self) -> None:
+        """Read NMEA until stopped; reconnect if the UART drops."""
+        while not self._stop.is_set():
+            try:
+                self._serial = self._serial_factory(self._port, self._baud_rate)
+            except Exception as error:
+                message = str(error).strip() or "GPS is disconnected."
+                with self._lock:
+                    self._error = "GPS is disconnected."
+                logger.warning("GPS serial open failed on %s: %s", self._port, message)
+                self._stop.wait(2.0)
+                continue
+
+            with self._lock:
+                self._error = None
+            logger.info("GPS serial open on %s at %s baud", self._port, self._baud_rate)
+
+            try:
+                while not self._stop.is_set():
+                    serial_port = self._serial
+                    if serial_port is None:
+                        break
+                    try:
+                        raw = serial_port.readline()
+                    except Exception as error:
+                        if self._stop.is_set():
+                            break
+                        message = str(error).strip() or "GPS is disconnected."
+                        with self._lock:
+                            self._error = "GPS is disconnected."
+                        logger.warning("GPS serial read failed: %s", message)
+                        break
+                    if not raw:
+                        continue
+                    if isinstance(raw, bytes):
+                        line = raw.decode("ascii", errors="ignore")
+                    else:
+                        line = str(raw)
+                    fix = parse_nmea_line(line)
+                    if fix is None:
+                        continue
+                    with self._lock:
+                        self._fix = fix
+                        self._error = None
+            finally:
+                self._close_serial()
+
+            if not self._stop.is_set():
+                self._stop.wait(1.0)
+
+    async def current_fix(self) -> LocationFix:
+        """Return the latest valid fix, or raise a speakable GPS error."""
+        if not self._started:
+            self.start()
+
+        deadline = time.monotonic() + self._fix_wait_seconds
+        while True:
+            with self._lock:
+                fix = self._fix
+                error = self._error
+            if fix is not None:
+                age = time.time() - fix.timestamp
+                if age <= self._stale_after_seconds:
+                    return fix
+            if error and fix is None:
+                # Keep waiting a bit in case the reader reconnects mid-question.
+                if time.monotonic() >= deadline:
+                    raise RuntimeError(error)
+            elif time.monotonic() >= deadline:
+                raise RuntimeError("Waiting for a GPS fix.")
+            await asyncio.sleep(0.05 if self._fix_wait_seconds == 0 else 0.2)
+
+    def apply_nmea_for_tests(self, sentence: str, *, timestamp: float | None = None) -> None:
+        """Inject one NMEA sentence without opening a serial port (unit tests)."""
+        self._started = True
+        fix = parse_nmea_line(sentence, timestamp=timestamp)
+        if fix is None:
+            return
+        with self._lock:
+            self._fix = fix
+            self._error = None
+
+    async def close(self) -> None:
+        """Stop the reader thread and close the serial port."""
+        self._stop.set()
+        # Null the handle before close so the reader loop stops calling readline.
+        self._close_serial()
+        thread = self._thread
+        self._thread = None
+        if thread is not None and thread.is_alive():
+            await asyncio.to_thread(thread.join, 2.0)
+        self._started = False
+        with self._lock:
+            self._fix = None
+            self._error = None
+
+
 class PiPeripherals:
     """Bundled Pi peripherals; capture stays deferred until matching buttons."""
 
-    def __init__(self) -> None:
+    def __init__(self, settings: Settings) -> None:
         self.audio_input = create_audio_input()
         self.audio_output = create_audio_output()
         self.camera = create_camera()
+        self.location = create_location(settings)
         self.talk_button = create_button(TALK_BUTTON_GPIO)
         self.camera_button = create_button(CAMERA_BUTTON_GPIO)
         self.volume_up_button = create_button(VOLUME_UP_BUTTON_GPIO)
         self.volume_down_button = create_button(VOLUME_DOWN_BUTTON_GPIO)
 
     async def start(self) -> None:
-        """Audio starts when Talk is held; the camera when its button is pressed."""
+        """Start GPS reading; defer audio and camera until their buttons are held."""
+        location = self.location
+        start = getattr(location, "start", None)
+        if callable(start):
+            start()
 
     async def close(self) -> None:
         await self.audio_input.close()
         await self.audio_output.close()
         await self.camera.close()
+        await self.location.close()
         await self.talk_button.close()
         await self.camera_button.close()
         await self.volume_up_button.close()
         await self.volume_down_button.close()
 
 
-def create_peripherals(_settings: Settings) -> CompanionPeripherals:
+def create_peripherals(settings: Settings) -> CompanionPeripherals:
     """Build the Raspberry Pi peripheral bundle used for hardware mode."""
-    return PiPeripherals()
+    return PiPeripherals(settings)
 
 
 def create_audio_input() -> AudioInput:
@@ -734,3 +976,11 @@ def create_camera() -> Camera:
 def create_button(pin: int) -> Button:
     """Create a GPIO button driver exposing transitions as an async event stream."""
     return PiButton(pin)
+
+
+def create_location(settings: Settings) -> Location:
+    """Create a NEO-M8N UART location driver from settings."""
+    return NeoM8NLocation(
+        port=settings.gps_serial_port,
+        baud_rate=settings.gps_baud_rate,
+    )

@@ -46,7 +46,9 @@ Reply in English by default. A very short or unclear question that sounds \
 like another language is probably misheard English, so still answer in \
 English. Only use another language when the user clearly asks for it \
 (for example "translate this to Spanish" or "speak Urdu"), or speaks to you \
-in full, clear sentences in that language. When asked to translate text in \
+in full, clear sentences in that language. Always keep navigation cues, \
+destination confirmations, and turn-by-turn directions in English unless \
+the user clearly asks for another language. When asked to translate text in \
 a picture, read the original exactly first, then give the translation.
 
 Honesty rules (most important):
@@ -137,8 +139,10 @@ _FACES_USER_NOTE = (
 def build_system_instruction(camera_faces_user: bool) -> str:
     """Gemini's instructions. The laptop webcam faces you (directions flip);
     the Pi camera points away from you like a phone's back camera."""
+    from location.tools import LOCATION_INSTRUCTION
+
     note = _FACES_USER_NOTE if camera_faces_user else _FACES_AWAY_NOTE
-    return _BASE_INSTRUCTION.format(direction_note=note)
+    return _BASE_INSTRUCTION.format(direction_note=note) + LOCATION_INSTRUCTION
 
 
 # Default (Pi-style camera). gemini_service picks the right one.
